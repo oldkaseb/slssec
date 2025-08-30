@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Souls Guard Bot — single file (patched)
+# Souls Guard Bot — single file (final)
 # Python 3.11+
 import asyncio
 import logging
@@ -53,8 +53,9 @@ ROLE_ORDER = {
     "member": 99
 }
 
-# مجوز نقش‌ها (FIX: جداسازی دقیق چت/کال)
+# مجوز نقش‌ها
 ALLOWED_VOICE_ROLES = {
+    # فقط نقش‌های کال + مالک
     "owner", "senior_all", "senior_call", "admin_call"
 }
 ALLOWED_CHAT_ROLES = {
@@ -189,8 +190,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_date_kind_user ON sessions(start_date, k
 
 async def ensure_user(pool, u):
     async with pool.acquire() as con:
-        await con.execute(
-            """
+        await con.execute("""
             INSERT INTO users(user_id, username, first_name, last_name)
             VALUES($1,$2,$3,$4)
             ON CONFLICT (user_id) DO UPDATE SET
@@ -198,9 +198,7 @@ async def ensure_user(pool, u):
                 first_name=EXCLUDED.first_name,
                 last_name=EXCLUDED.last_name,
                 updated_at=now()
-            """,
-            u.id, (u.username or ""), (u.first_name or ""), (u.last_name or "")
-        )
+        """, u.id, (u.username or ""), (u.first_name or ""), (u.last_name or ""))
 
 async def get_role(pool, user_id: int) -> str:
     async with pool.acquire() as con:
@@ -210,129 +208,92 @@ async def get_role(pool, user_id: int) -> str:
 async def set_role(pool, user_id: int, role: str):
     if role not in ROLES: return False
     async with pool.acquire() as con:
-        await con.execute(
-            """
+        await con.execute("""
             INSERT INTO users(user_id, role, joined_guard_at)
             VALUES($1,$2,now())
             ON CONFLICT (user_id) DO UPDATE SET role=EXCLUDED.role,
             joined_guard_at = COALESCE(users.joined_guard_at, now())
-            """,
-            user_id, role
-        )
+        """, user_id, role)
     return True
 
 async def open_session(pool, user_id: int, kind: str, source: str=None):
     d = today_teh()
     t = now_teh()
     async with pool.acquire() as con:
-        await con.execute(
-            """
+        await con.execute("""
             UPDATE sessions SET end_at=now(), last_activity=now()
             WHERE user_id=$1 AND kind=$2 AND end_at IS NULL AND start_date<>$3
-            """,
-            user_id, kind, d
-        )
+        """, user_id, kind, d)
         try:
-            await con.execute(
-                """
+            await con.execute("""
                 INSERT INTO sessions(user_id, kind, start_at, last_activity, start_date, source)
                 VALUES($1,$2,$3,$3,$4,$5)
-                """,
-                user_id, kind, t, d, source or ""
-            )
+            """, user_id, kind, t, d, source or "")
         except Exception:
-            await con.execute(
-                """
+            await con.execute("""
                 UPDATE sessions SET last_activity=now()
                 WHERE user_id=$1 AND kind=$2 AND end_at IS NULL
-                """,
-                user_id, kind
-            )
+            """, user_id, kind)
 
 async def touch_activity(pool, user_id: int, kind: str):
     async with pool.acquire() as con:
-        await con.execute(
-            """
+        await con.execute("""
             UPDATE sessions SET last_activity=now()
             WHERE user_id=$1 AND kind=$2 AND end_at IS NULL
-            """,
-            user_id, kind
-        )
+        """, user_id, kind)
 
 async def close_session(pool, user_id: int, kind: str):
     async with pool.acquire() as con:
-        await con.execute(
-            """
+        await con.execute("""
             UPDATE sessions SET end_at=now(), last_activity=now()
             WHERE user_id=$1 AND kind=$2 AND end_at IS NULL
-            """,
-            user_id, kind
-        )
+        """, user_id, kind)
 
 async def count_open(pool, user_id: int, kind: str) -> int:
     async with pool.acquire() as con:
-        return await con.fetchval(
-            """
+        return await con.fetchval("""
             SELECT count(*) FROM sessions
             WHERE user_id=$1 AND kind=$2 AND end_at IS NULL
-            """,
-            user_id, kind
-        )
+        """, user_id, kind)
 
-# (FIX) جلوگیری از ForeignKeyViolation در ریپلای‌ها با upsert مخاطبِ ریپلای
 async def inc_chat_metrics(pool, user_id: int, msg: Message):
     d = today_teh()
     is_reply = msg.reply_to_message is not None
-
-    # اگر ریپلای است، اول کاربرِ هدف را در users ثبت/به‌روز کنیم
-    if is_reply and msg.reply_to_message and msg.reply_to_message.from_user:
-        try:
-            await ensure_user(pool, msg.reply_to_message.from_user)
-        except Exception:
-            pass
-
     async with pool.acquire() as con:
-        await con.execute(
-            """
+        await con.execute("""
             INSERT INTO chat_metrics(user_id, d, msgs, replies_sent, replies_received)
             VALUES($1,$2,$3,$4,$5)
             ON CONFLICT (user_id, d) DO UPDATE SET
                 msgs = chat_metrics.msgs + EXCLUDED.msgs,
                 replies_sent = chat_metrics.replies_sent + EXCLUDED.replies_sent,
                 replies_received = chat_metrics.replies_received + EXCLUDED.replies_received
-            """,
-            user_id, d, 1, (1 if is_reply else 0), 0
-        )
+        """, user_id, d, 1, (1 if is_reply else 0), 0)
+
         if is_reply and msg.reply_to_message and msg.reply_to_message.from_user:
+            # PATCH 1: اطمینان از وجود کاربر هدف (جلوگیری از خطای FK)
+            await ensure_user(pool, msg.reply_to_message.from_user)
             target = msg.reply_to_message.from_user.id
-            await con.execute(
-                """
+            await con.execute("""
                 INSERT INTO chat_metrics(user_id, d, msgs, replies_sent, replies_received)
                 VALUES($1,$2,0,0,1)
                 ON CONFLICT (user_id, d) DO UPDATE SET
                     replies_received = chat_metrics.replies_received + 1
-                """,
-                target, d
-            )
+            """, target, d)
 
         # کاندیدهای ادمینی
-        await con.execute(
-            """
+        await con.execute("""
             INSERT INTO candidates_daily(user_id, d, chat_msgs)
             VALUES($1,$2,1)
             ON CONFLICT (user_id, d) DO UPDATE SET
                 chat_msgs = candidates_daily.chat_msgs + 1
-            """,
-            user_id, d
-        )
+        """, user_id, d)
 
 # ---------- آمار «فقط گروه اصلی» ----------
 async def admin_today_stats_main(pool, user_id: int):
     d = today_teh()
     pat = f"%{src_tag(MAIN_CHAT_ID)}%"
     async with pool.acquire() as con:
-        row = await con.fetchrow(
-            """
+        row = await con.fetchrow("""
         WITH cm AS (
             SELECT COALESCE(SUM(msgs),0) as msgs,
                    COALESCE(SUM(replies_sent),0) as r_sent,
@@ -351,17 +312,14 @@ async def admin_today_stats_main(pool, user_id: int):
         )
         SELECT cm.msgs, cm.r_sent, cm.r_recv, chat_secs.secs as chat_secs, call_secs.secs as call_secs
         FROM cm, chat_secs, call_secs
-        """,
-            user_id, d, pat
-        )
+        """, user_id, d, pat)
         return row
 
 async def admins_overview_today_main(pool):
     d = today_teh()
     pat = f"%{src_tag(MAIN_CHAT_ID)}%"
     async with pool.acquire() as con:
-        rows = await con.fetch(
-            """
+        rows = await con.fetch("""
         WITH u AS (
             SELECT user_id, role, rank, username, first_name, last_name
             FROM users WHERE role <> 'member'
@@ -390,17 +348,14 @@ async def admins_overview_today_main(pool):
         LEFT JOIN cm ON cm.user_id=u.user_id
         LEFT JOIN chat_secs ON chat_secs.user_id=u.user_id
         LEFT JOIN call_secs ON call_secs.user_id=u.user_id
-        """,
-            d, pat
-        )
+        """, d, pat)
         return rows
 
 async def last_30_days_stats_main(pool, user_id: int):
     start_d = today_teh() - timedelta(days=30)
     pat = f"%{src_tag(MAIN_CHAT_ID)}%"
     async with pool.acquire() as con:
-        row = await con.fetchrow(
-            """
+        row = await con.fetchrow("""
         WITH cm AS (
             SELECT COALESCE(SUM(msgs),0) msgs,
                    COALESCE(SUM(replies_sent),0) rs,
@@ -415,9 +370,7 @@ async def last_30_days_stats_main(pool, user_id: int):
         SELECT cm.msgs, cm.rs, cm.rr,
                COALESCE((SELECT secs FROM sess WHERE kind='chat'),0) chat_secs,
                COALESCE((SELECT secs FROM sess WHERE kind='call'),0) call_secs
-        """,
-            user_id, start_d, pat
-        )
+        """, user_id, start_d, pat)
     return row
 
 # ----------------------------- Keyboards -------------------------------------
@@ -539,28 +492,23 @@ async def on_startup():
     async with pool.acquire() as con:
         for stmt in [s.strip() for s in SCHEMA_SQL.split(";") if s.strip()]:
             await con.execute(stmt + ";")
-        await con.execute(
-            """
+        await con.execute("""
             INSERT INTO groups (group_type, chat_id, title)
             VALUES ('main', $1, 'souls')
             ON CONFLICT (group_type) DO UPDATE SET chat_id=EXCLUDED.chat_id, title=EXCLUDED.title
-            """,
-            MAIN_CHAT_ID
-        )
-        await con.execute(
-            """
+        """, MAIN_CHAT_ID)
+        await con.execute("""
             INSERT INTO groups (group_type, chat_id, title)
             VALUES ('guard', $1, 'souls guard')
             ON CONFLICT (group_type) DO UPDATE SET chat_id=EXCLUDED.chat_id, title=EXCLUDED.title
-            """,
-            GUARD_CHAT_ID
-        )
+        """, GUARD_CHAT_ID)
 
     if ENABLE_TELETHON and API_ID and API_HASH and TELETHON_SESSION:
         tclient = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
         await tclient.start()
         log.info("Telethon userbot started.")
 
+    # کران‌جاب‌ها
     scheduler.add_job(job_autoclose_inactive_chat, CronTrigger.from_crontab("*/1 * * * *"))
     scheduler.add_job(job_autoclose_inactive_call_fallback, CronTrigger.from_crontab("*/1 * * * *"))
     scheduler.add_job(job_daily_rollover_main_only, CronTrigger(hour=0, minute=0))  # فقط گروه اصلی
@@ -573,15 +521,13 @@ dp.startup.register(on_startup)
 async def job_autoclose_inactive_chat():
     try:
         async with pool.acquire() as con:
-            rows = await con.fetch(
-                """
+            rows = await con.fetch("""
                 SELECT s.user_id
                 FROM sessions s
                 JOIN users u ON u.user_id=s.user_id
                 WHERE s.kind='chat' AND s.end_at IS NULL
                   AND now() - s.last_activity > INTERVAL '10 minutes'
-                """
-            )
+            """)
         for r in rows:
             await close_session(pool, r["user_id"], "chat")
             try:
@@ -620,10 +566,7 @@ async def job_daily_rollover_main_only():
         if not rows:
             return
         lines = ["📊 <b>آمار امروز ادمین‌ها — فقط گروه اصلی</b>\n(از ۰۰:۰۰ تا اکنون به وقت تهران)\n"]
-        rows_sorted = sorted(
-            rows,
-            key=lambda r: (ROLE_ORDER.get(r["role"], 999), -r["msgs"], -r["chat_secs"], -r["call_secs"]) 
-        )
+        rows_sorted = sorted(rows, key=lambda r: (ROLE_ORDER.get(r["role"], 999), -r["msgs"], -r["chat_secs"], -r["call_secs"]))
         for r in rows_sorted:
             name = r["first_name"] or ""
             un = f"@{r['username']}" if r["username"] else ""
@@ -640,7 +583,7 @@ async def job_daily_rollover_main_only():
 
 # ------------------------------ Handlers -------------------------------------
 
-# شمارش پیام‌ها + به‌روزرسانی فعالیت: فقط گروه اصلی (برای آمار و ضد-خواب)
+# شمارش پیام‌ها: فقط گروه اصلی (برای آمار)
 @dp.message((F.chat.id == MAIN_CHAT_ID) | (F.chat.id == GUARD_CHAT_ID), F.from_user)
 async def any_group_common(msg: Message):
     u = msg.from_user
@@ -654,10 +597,10 @@ async def any_group_common(msg: Message):
         except Exception:
             pass
         return
-    # فقط اگر داخل گروه اصلی است، پیام را در آمار ثبت کن و آخرین فعالیت را بروز کن
+    # فقط اگر داخل گروه اصلی است، پیام را در آمار ثبت کن
     if msg.chat.id == MAIN_CHAT_ID:
         await inc_chat_metrics(pool, u.id, msg)
-        # (FIX) جلوگیری از خروج خودکارِ نابه‌جا: با هر پیام، فعالیت چت کاربر را بروز می‌کنیم
+        # PATCH 2: تمدید last_activity برای جلوگیری از خروج خودکار اشتباهی
         await touch_activity(pool, u.id, "chat")
 
 # /start در پیوی
@@ -866,18 +809,11 @@ async def pv_buttons(cb: CallbackQuery):
         await cb.message.edit_text("\n".join(lines))
         return await cb.answer()
 
-    if cb.data in {"pv:send_to_main","pv:send_report_owner","pv:report_admin_chat"}:
-        if not (role in {"admin_chat","senior_chat","senior_all"} or is_owner):
-            return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
-        await cb.message.edit_text("متن خود را ارسال کنید. (لغو: /cancel)")
+    # ارسال/گزارش‌های متنی
+    if cb.data in {"pv:send_to_main","pv:send_report_owner","pv:report_admin_chat",
+                   "pv:send_to_main_voice","pv:send_report_owner_voice","pv:report_admin_voice"}:
         PENDING_REPORT[cb.from_user.id] = {"type": cb.data}
-        return await cb.answer()
-
-    if cb.data in {"pv:send_to_main_voice","pv:send_report_owner_voice","pv:report_admin_voice"}:
-        if not (role in {"admin_call","senior_call","senior_all"} or is_owner):
-            return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
         await cb.message.edit_text("متن خود را ارسال کنید. (لغو: /cancel)")
-        PENDING_REPORT[cb.from_user.id] = {"type": cb.data}
         return await cb.answer()
 
     return await cb.answer()
@@ -934,18 +870,41 @@ async def pv_text_flow(msg: Message):
     if uid in PENDING_CONTACT_OWNER:
         PENDING_CONTACT_OWNER.discard(uid)
         await bot.send_message(OWNER_ID, f"📩 پیام از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-        return await msg.reply("به مالک ارسال شد ✅")
+        return await msg.reply("به مالک ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
 
     if uid in PENDING_CONTACT_GUARD:
         PENDING_CONTACT_GUARD.discard(uid)
         await bot.send_message(GUARD_CHAT_ID, f"📣 پیام از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-        return await msg.reply("به گارد ارسال شد ✅")
+        return await msg.reply("به گارد ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
 
+    # PATCH 3: پوشش کامل مسیرهای PENDING_REPORT
     if uid in PENDING_REPORT:
         ctx = PENDING_REPORT.pop(uid)
-        if ctx["type"] == "member":
+        typ = ctx["type"]
+
+        if typ == "member":
             await bot.send_message(OWNER_ID, f"🚨 گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-            return await msg.reply("گزارش به مالک ارسال شد ✅")
+            return await msg.reply("گزارش به مالک ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
+
+        # ارسال به گروه اصلی (چت/کال)
+        if typ in {"pv:send_to_main", "pv:send_to_main_voice"}:
+            prefix = "📝" if typ == "pv:send_to_main" else "🎙️📝"
+            await bot.send_message(MAIN_CHAT_ID, f"{prefix} پیام از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
+            return await msg.reply("به گروه اصلی ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
+
+        # گزارش به مالک (چت/کال)
+        if typ in {"pv:send_report_owner", "pv:send_report_owner_voice"}:
+            prefix = "📮" if typ == "pv:send_report_owner" else "🎙️📮"
+            await bot.send_message(OWNER_ID, f"{prefix} گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
+            return await msg.reply("گزارش به مالک ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
+
+        # گزارش ادمین چت/کال → به گارد هم کپی می‌شود
+        if typ in {"pv:report_admin_chat", "pv:report_admin_voice"}:
+            prefix = "🚨 چت" if typ == "pv:report_admin_chat" else "🚨 کال"
+            body = f"{prefix} | گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}"
+            await bot.send_message(OWNER_ID, body)
+            await bot.send_message(GUARD_CHAT_ID, body)
+            return await msg.reply("گزارش ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
 
 # ------------------ درخواست ادمینی برای اعضای عادی ------------------
 def kb_apply_admin():
@@ -966,8 +925,7 @@ async def get_user_last_days_stats(pool, user_id: int, days: int = 7):
     start_d = today_teh() - timedelta(days=days)
     pat = f"%{src_tag(MAIN_CHAT_ID)}%"
     async with pool.acquire() as con:
-        row = await con.fetchrow(
-            """
+        row = await con.fetchrow("""
         WITH cm AS (
             SELECT COALESCE(SUM(msgs),0) AS chat_msgs
             FROM chat_metrics
@@ -983,9 +941,7 @@ async def get_user_last_days_stats(pool, user_id: int, days: int = 7):
         )
         SELECT cm.chat_msgs, chat_secs.secs AS chat_secs, call_secs.secs AS call_secs
         FROM cm, chat_secs, call_secs
-        """,
-            user_id, start_d, pat
-        )
+        """, user_id, start_d, pat)
     return row or {"chat_msgs":0, "chat_secs":0, "call_secs":0}
 
 @dp.callback_query(F.data.regexp(r"^rq:(chat|call)$"))
@@ -1148,9 +1104,14 @@ async def owner_text_commands(msg: Message):
                 return await msg.reply("برای اتک‌بک باید Telethon فعال باشد. (ENABLE_TELETHON=1 و سشن معتبر)")
             try:
                 entity = await tclient.get_entity(link)
-                await tclient.join(entity)
-                from telethon.tl.functions.channels import GetParticipantsRequest
+                # پیوستن به مقصد (سازگار با Telethon کلاسیک)
+                from telethon.tl.functions.channels import JoinChannelRequest, GetParticipantsRequest
                 from telethon.tl.types import ChannelParticipantsAdmins, ChannelParticipantsRecent
+                try:
+                    await tclient(JoinChannelRequest(entity))
+                except Exception:
+                    pass  # اگر عضو بودیم، نادیده بگیر
+
                 admins = await tclient(GetParticipantsRequest(entity, ChannelParticipantsAdmins(), 0, 1000, 0))
                 recents = await tclient(GetParticipantsRequest(entity, ChannelParticipantsRecent(), 0, 2000, 0))
                 admin_ids = {p.user_id for p in admins.participants}
