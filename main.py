@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Souls Guard Bot — single file (final)
+# Souls Guard Bot — single file (FULL, text-only commands)
 # Python 3.11+
 import asyncio
 import logging
@@ -12,11 +12,14 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode, ChatType
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove, ChatMemberUpdated
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+
+APP_VERSION = "2025-08-31-text"
+STARTED_AT = datetime.utcnow()
 
 # -------- Optional Telethon (userbot) ----------
 ENABLE_TELETHON = os.getenv("ENABLE_TELETHON", "0") == "1"
@@ -55,8 +58,8 @@ ROLE_ORDER = {
 
 # مجوز نقش‌ها
 ALLOWED_VOICE_ROLES = {
-    # فقط نقش‌های کال + مالک
-    "owner", "senior_all", "senior_call", "admin_call"
+    "owner", "senior_all", "senior_call", "admin_call",
+    "senior_chat", "admin_chat",
 }
 ALLOWED_CHAT_ROLES = {
     "owner", "senior_all", "senior_chat", "admin_chat"
@@ -104,11 +107,15 @@ def role_title(role: str) -> str:
     }.get(role, role)
 
 def src_tag(chat_id: int) -> str:
-    """توکن استاندارد برای ذخیرهٔ شناسهٔ چت در ستون source سشن‌ها"""
     return f"src:{chat_id}"
 
 def has_main_src(source: str) -> bool:
     return source and (src_tag(MAIN_CHAT_ID) in source)
+
+def uptime_str() -> str:
+    d = datetime.utcnow() - STARTED_AT
+    s = int(d.total_seconds())
+    return pretty_td(s)
 
 # ----------------------------- Database --------------------------------------
 SCHEMA_SQL = """
@@ -136,7 +143,7 @@ CREATE TABLE IF NOT EXISTS sessions(
     end_at TIMESTAMPTZ,
     last_activity TIMESTAMPTZ,
     start_date DATE NOT NULL,
-    source TEXT  -- اینجا برچسب src:<chat_id> ذخیره می‌شود
+    source TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_session
@@ -268,10 +275,7 @@ async def inc_chat_metrics(pool, user_id: int, msg: Message):
                 replies_sent = chat_metrics.replies_sent + EXCLUDED.replies_sent,
                 replies_received = chat_metrics.replies_received + EXCLUDED.replies_received
         """, user_id, d, 1, (1 if is_reply else 0), 0)
-
         if is_reply and msg.reply_to_message and msg.reply_to_message.from_user:
-            # PATCH 1: اطمینان از وجود کاربر هدف (جلوگیری از خطای FK)
-            await ensure_user(pool, msg.reply_to_message.from_user)
             target = msg.reply_to_message.from_user.id
             await con.execute("""
                 INSERT INTO chat_metrics(user_id, d, msgs, replies_sent, replies_received)
@@ -280,7 +284,6 @@ async def inc_chat_metrics(pool, user_id: int, msg: Message):
                     replies_received = chat_metrics.replies_received + 1
             """, target, d)
 
-        # کاندیدهای ادمینی
         await con.execute("""
             INSERT INTO candidates_daily(user_id, d, chat_msgs)
             VALUES($1,$2,1)
@@ -424,13 +427,14 @@ def help_text_for_role(role: str, is_owner: bool=False) -> str:
         "• «ثبت ورود» و «ثبت خروج» یکسان؛ انتخاب نوع با دکمه.",
         "• «ثبت» وضعیت فعلی + آمار امروز را می‌دهد.",
         "• <b>آمار فقط مربوط به گروه اصلی است.</b>",
+        "• اگر دکمه‌ها نمی‌آیند: پرایوسی BotFather را Disable کن و شناسهٔ گروه‌ها را با دستور متنی whereami چک کن.",
     ]
     if is_owner or role in {"senior_chat","senior_all"}:
         base += ["", "<b>ابزار ارشد چت</b>", "لیست ادمین‌های چت / پیام به گروه / گزارش به مالک / گزارش ادمین چت"]
     if is_owner or role in {"senior_call","senior_all"}:
         base += ["", "<b>ابزار ارشد کال</b>", "لیست ادمین‌های کال / پیام به گروه (کال) / گزارش به مالک (کال) / گزارش ادمین کال"]
     if is_owner or role == "owner":
-        base += ["", "<i>✋ «راهنما» برای مالک = راهنمای کامل متنی.</i>"]
+        base += ["", "<i>تشخیصی‌ها (متنی): whereami / whoami / health</i>"]
     return "\n".join(base)
 
 def owner_help_text() -> str:
@@ -446,20 +450,20 @@ def owner_help_text() -> str:
         "• <code>عزل چت|کال|ارشدچت|ارشدکال|ارشدکل @username|id</code>",
         "",
         "<b>آمار (فقط گروه اصلی)</b>",
-        "• <code>آمار چت الان</code> — زمان چت + پیام‌های امروز (اصلی)",
-        "• <code>آمار کال الان</code> — زمان کال امروز (فقط اگر ثبت از اصلی شده باشد)",
-        "• <code>آمار</code> — تعداد کاربران فعال امروز (اصلی)",
-        "• <code>آمار کلی کاربر id</code> — ۳۰ روز اخیر (اصلی)",
+        "• <code>آمار چت الان</code> — زمان چت + پیام‌های امروز",
+        "• <code>آمار کال الان</code> — زمان کال امروز",
+        "• <code>آمار</code> — تعداد کاربران فعال امروز",
+        "• <code>آمار کلی کاربر id</code> — ۳۰ روز اخیر",
         "",
         "<b>تگ گروهی (ریپلای روی پیام)</b>",
         "• <code>تگ چت</code> — منشن چتی‌ها",
         "• <code>تگ کال</code> — منشن کولی‌ها",
         "• <code>تگ همه</code> — هر دو (فقط مالک/ارشدکل)",
         "",
-        "<b>میان‌برهای ثبت</b>",
-        "• <code>ثبت ورود</code> → انتخاب چت/کال",
-        "• <code>ثبت خروج</code> → خروج مستقیم اگر یکی باز باشد، وگرنه انتخاب نوع",
-        "• <code>ثبت</code> → وضعیت + آمار امروز (اصلی)",
+        "<b>تشخیصی (متنی)</b>",
+        "• <code>whereami</code> — هرجا (فقط مالک/ادمین‌ها)",
+        "• <code>whoami</code> — پی‌وی",
+        "• <code>health</code> — پی‌وی فقط مالک",
     ])
 
 # ----------------------------- Bot Init --------------------------------------
@@ -470,7 +474,8 @@ pool: asyncpg.Pool = None
 tclient = None
 
 # ----------------------------- Help Handlers ---------------------------------
-@dp.message(Command(commands=["help"]), F.chat.type == ChatType.PRIVATE)
+# فقط متنی
+@dp.message(F.text.regexp(r"^(?:راهنما|help)$"), F.chat.type == ChatType.PRIVATE)
 async def help_pv(msg: Message):
     role = await get_role(pool, msg.from_user.id)
     is_owner = (msg.from_user.id == OWNER_ID)
@@ -478,12 +483,56 @@ async def help_pv(msg: Message):
         return await msg.answer(owner_help_text())
     await msg.answer(help_text_for_role(role, is_owner))
 
-@dp.message(F.text.regexp(r"^(?:راهنما|help|/?help)$"))
+@dp.message(F.text.regexp(r"^(?:راهنما|help)$"))
 async def help_anywhere(msg: Message):
     if msg.from_user.id == OWNER_ID:
         return await msg.reply(owner_help_text())
     role = await get_role(pool, msg.from_user.id)
     await msg.reply(help_text_for_role(role, is_owner=False))
+
+# ---------------------------- Diagnostics (TEXT) ------------------------------
+@dp.message(F.text.regexp(r"^(?:whereami|کجا(?:ی)?(?: هستم)?|کجا هستیم)$"))
+async def whereami_text(msg: Message):
+    who = msg.from_user
+    role = await get_role(pool, who.id)
+    if who.id != OWNER_ID and not is_admin_role(role):
+        return await msg.reply("این دستور برای مالک/ادمین‌هاست.")
+    title = msg.chat.title or ""
+    await msg.reply(
+        f"🛰️ <b>whereami</b>\n"
+        f"chat_id: <code>{msg.chat.id}</code>\n"
+        f"type: <code>{msg.chat.type}</code>\n"
+        f"title: <code>{title}</code>"
+    )
+
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(r"^(?:whoami|آیدی من|ایدی من)$"))
+async def whoami_text(msg: Message):
+    await msg.reply(f"🆔 آیدی شما: <code>{msg.from_user.id}</code>")
+
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(r"^(?:health|سلامت|وضعیت)$"))
+async def health_text(msg: Message):
+    if msg.from_user.id != OWNER_ID:
+        return await msg.reply("فقط مالک.")
+    db_ok = False
+    try:
+        async with pool.acquire() as con:
+            _ = await con.fetchval("SELECT 1")
+            db_ok = True
+    except Exception as e:
+        db_err = str(e)
+    lines = [
+        f"💚 <b>Souls Guard — Health</b> v{APP_VERSION}",
+        f"uptime: {uptime_str()}",
+        f"DB: {'OK' if db_ok else 'FAIL'}",
+        f"MAIN_CHAT_ID: <code>{MAIN_CHAT_ID}</code>",
+        f"GUARD_CHAT_ID: <code>{GUARD_CHAT_ID}</code>",
+        f"TEHRAN now: <code>{now_teh().isoformat()}</code>",
+        "Jobs: autoclose(chat/call) each minute, daily rollover 00:00 Tehran",
+        "⚠️ اگر در گروه اصلی پیام می‌دهید و دکمه‌ها نمی‌آیند: پرایوسی BotFather را Disable کنید و ربات را دوباره به گروه اضافه کنید.",
+    ]
+    if not db_ok:
+        lines.append(f"DB error: <code>{db_err}</code>")
+    await msg.reply("\n".join(lines))
 
 # ---------------------------- Startup ----------------------------------------
 async def on_startup():
@@ -508,12 +557,15 @@ async def on_startup():
         await tclient.start()
         log.info("Telethon userbot started.")
 
-    # کران‌جاب‌ها
     scheduler.add_job(job_autoclose_inactive_chat, CronTrigger.from_crontab("*/1 * * * *"))
     scheduler.add_job(job_autoclose_inactive_call_fallback, CronTrigger.from_crontab("*/1 * * * *"))
-    scheduler.add_job(job_daily_rollover_main_only, CronTrigger(hour=0, minute=0))  # فقط گروه اصلی
+    scheduler.add_job(job_daily_rollover_main_only, CronTrigger(hour=0, minute=0))
     scheduler.start()
     log.info("Scheduler started.")
+    try:
+        await bot.send_message(OWNER_ID, f"✅ Bot started v{APP_VERSION} — tz={TEHRAN.key}, uptime {uptime_str()}")
+    except Exception:
+        pass
 
 dp.startup.register(on_startup)
 
@@ -560,7 +612,6 @@ async def job_autoclose_inactive_call_fallback():
         CALL_HEARTBEATS.pop(uid, None)
 
 async def job_daily_rollover_main_only():
-    """گزارش روزانه فقط از گروه اصلی؛ ارسال به گارد و مالک"""
     try:
         rows = await admins_overview_today_main(pool)
         if not rows:
@@ -583,12 +634,27 @@ async def job_daily_rollover_main_only():
 
 # ------------------------------ Handlers -------------------------------------
 
+@dp.my_chat_member()
+async def my_member_updates(ev: ChatMemberUpdated):
+    try:
+        chat = ev.chat
+        new = ev.new_chat_member
+        old = ev.old_chat_member
+        await bot.send_message(
+            OWNER_ID,
+            f"ℹ️ <b>my_chat_member</b>\n"
+            f"chat_id: <code>{chat.id}</code> ({chat.type})\n"
+            f"status: <code>{old.status} ➜ {new.status}</code>\n"
+            f"is_admin: <code>{getattr(new, 'is_chat_admin', False)}</code>"
+        )
+    except Exception:
+        pass
+
 # شمارش پیام‌ها: فقط گروه اصلی (برای آمار)
 @dp.message((F.chat.id == MAIN_CHAT_ID) | (F.chat.id == GUARD_CHAT_ID), F.from_user)
 async def any_group_common(msg: Message):
     u = msg.from_user
     await ensure_user(pool, u)
-    # بن در هر دو گروه
     async with pool.acquire() as con:
         banned = await con.fetchval("SELECT 1 FROM bans WHERE user_id=$1", u.id)
     if banned:
@@ -597,13 +663,10 @@ async def any_group_common(msg: Message):
         except Exception:
             pass
         return
-    # فقط اگر داخل گروه اصلی است، پیام را در آمار ثبت کن
     if msg.chat.id == MAIN_CHAT_ID:
         await inc_chat_metrics(pool, u.id, msg)
-        # PATCH 2: تمدید last_activity برای جلوگیری از خروج خودکار اشتباهی
-        await touch_activity(pool, u.id, "chat")
 
-# /start در پیوی
+# /start در پی‌وی (اجباری تلگرام برای آغاز PM) + معادل متنی در پایین
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def start_pv(msg: Message):
     await ensure_user(pool, msg.from_user)
@@ -623,13 +686,20 @@ async def start_pv(msg: Message):
             reply_markup=ReplyKeyboardRemove()
         )
 
+# معادل متنی شروع پنل در پی‌وی
+@dp.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(r"^(?:سلام|شروع|پنل|panel|menu|منو)$"))
+async def pv_open_panel(msg: Message):
+    await ensure_user(pool, msg.from_user)
+    role = await get_role(pool, msg.from_user.id)
+    await msg.answer("پنل شما:", reply_markup=kb_admin_panel(role, is_owner=(msg.from_user.id==OWNER_ID)))
+
 # گروه اصلی: اولین پیام امروز → دکمه‌های ورود چت/کال
 @dp.message(F.chat.id == MAIN_CHAT_ID, F.from_user)
 async def main_group_prompt_first(msg: Message):
     u = msg.from_user
     await ensure_user(pool, u)
     role = await get_role(pool, u.id)
-    if role in (ALLOWED_CHAT_ROLES | ALLOWED_VOICE_ROLES):
+    if role in (ALLOWED_CHAT_ROLES | ALLOWED_VOICE_ROLES) or u.id == OWNER_ID:
         if await count_open(pool, u.id, "chat") == 0:
             d = today_teh()
             async with pool.acquire() as con:
@@ -647,7 +717,7 @@ async def main_group_prompt_first(msg: Message):
                         u.id, d
                     )
 
-# میان‌برهای یکسان «ثبت ورود / ثبت خروج / ثبت» در هر دو گروه
+# میان‌برهای یکسان «ثبت ورود / ثبت خروج / ثبت» در هر دو گروه (متنی)
 @dp.message((F.chat.id == MAIN_CHAT_ID) | (F.chat.id == GUARD_CHAT_ID), F.text)
 async def unified_shortcuts(msg: Message):
     u = msg.from_user
@@ -695,7 +765,7 @@ async def unified_shortcuts(msg: Message):
             else:
                 await msg.reply("کدام را می‌خواهید خارج شوید؟", reply_markup=kb_dual("co", u.id, True, True))
 
-# کال: دکمهٔ اینلاین اختیاری با «کال»
+# کال: دکمهٔ اینلاین با متن «کال»
 @dp.message(F.chat.id == MAIN_CHAT_ID, F.text.regexp(r"^کال$"))
 async def main_group_call_help(msg: Message):
     role = await get_role(pool, msg.from_user.id)
@@ -703,7 +773,7 @@ async def main_group_call_help(msg: Message):
         return await msg.reply("این بخش مخصوص ادمین‌ها/ارشدها/مالک است.")
     await msg.reply("برای کال یکی از گزینه‌ها را بزن:", reply_markup=kb_dual("ci", msg.from_user.id, False, True))
 
-# کال‌بک‌های ورود/خروج (چت/کال) — با برچسب src:<chat_id> در source
+# کال‌بک‌های ورود/خروج (چت/کال)
 @dp.callback_query(F.data.regexp(r"^(ci|co):(chat|call):(\d+)$"))
 async def cb_checkin_out(cb: CallbackQuery):
     action, kind, uid = cb.data.split(":")
@@ -774,12 +844,12 @@ async def pv_buttons(cb: CallbackQuery):
 
     if cb.data == "pv:contact_owner":
         PENDING_CONTACT_OWNER.add(cb.from_user.id)
-        await cb.message.edit_text("پیام‌تان به مالک را ارسال کنید (لغو: /cancel)")
+        await cb.message.edit_text("پیام‌تان به مالک را ارسال کنید (لغو: لغو / cancel)")
         return await cb.answer()
 
     if cb.data == "pv:contact_guard":
         PENDING_CONTACT_GUARD.add(cb.from_user.id)
-        await cb.message.edit_text("پیام شما به گروه گارد ارسال می‌شود: الان متن را بفرستید. (لغو: /cancel)")
+        await cb.message.edit_text("پیام شما به گروه گارد ارسال می‌شود: الان متن را بفرستید. (لغو: لغو / cancel)")
         return await cb.answer()
 
     if cb.data == "pv:report_user":
@@ -809,11 +879,18 @@ async def pv_buttons(cb: CallbackQuery):
         await cb.message.edit_text("\n".join(lines))
         return await cb.answer()
 
-    # ارسال/گزارش‌های متنی
-    if cb.data in {"pv:send_to_main","pv:send_report_owner","pv:report_admin_chat",
-                   "pv:send_to_main_voice","pv:send_report_owner_voice","pv:report_admin_voice"}:
+    if cb.data in {"pv:send_to_main","pv:send_report_owner","pv:report_admin_chat"}:
+        if not (role in {"admin_chat","senior_chat","senior_all"} or is_owner):
+            return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
+        await cb.message.edit_text("متن خود را ارسال کنید. (لغو: لغو / cancel)")
         PENDING_REPORT[cb.from_user.id] = {"type": cb.data}
-        await cb.message.edit_text("متن خود را ارسال کنید. (لغو: /cancel)")
+        return await cb.answer()
+
+    if cb.data in {"pv:send_to_main_voice","pv:send_report_owner_voice","pv:report_admin_voice"}:
+        if not (role in {"admin_call","senior_call","senior_all"} or is_owner):
+            return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
+        await cb.message.edit_text("متن خود را ارسال کنید. (لغو: لغو / cancel)")
+        PENDING_REPORT[cb.from_user.id] = {"type": cb.data}
         return await cb.answer()
 
     return await cb.answer()
@@ -824,7 +901,7 @@ async def pv_text_flow(msg: Message):
     uid = msg.from_user.id
     role = await get_role(pool, uid)
 
-    if msg.text == "/cancel":
+    if (msg.text or "").strip().lower() in {"لغو", "cancel", "/cancel"}:
         PENDING_CONTACT_GUARD.discard(uid)
         PENDING_CONTACT_OWNER.discard(uid)
         PENDING_REPORT.pop(uid, None)
@@ -832,10 +909,10 @@ async def pv_text_flow(msg: Message):
 
     t = (msg.text or "").strip().lower()
 
-    if t in {"پنل","panel","menu","منو","/panel"}:
+    if t in {"پنل","panel","menu","منو"}:
         return await msg.answer("پنل شما:", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
 
-    if t in {"آمار من","stats me","/me"}:
+    if t in {"آمار من","stats me"}:
         st = await admin_today_stats_main(pool, uid)
         open_chat = await count_open(pool, uid, "chat") > 0
         open_call = await count_open(pool, uid, "call") > 0
@@ -847,7 +924,7 @@ async def pv_text_flow(msg: Message):
                f"زمان کال: <b>{pretty_td(st['call_secs'])}</b>\n")
         return await msg.answer(txt, reply_markup=kb_dual("ci", uid, True, True))
 
-    if t in {"آمار کلی من","stats all","/me_all"}:
+    if t in {"آمار کلی من","stats all"}:
         st = await last_30_days_stats_main(pool, uid)
         txt = (f"📈 <b>۳۰ روز اخیر (فقط اصلی)</b>\n"
                f"پیام‌ها: <b>{st['msgs']}</b>\n"
@@ -857,11 +934,11 @@ async def pv_text_flow(msg: Message):
 
     if t in {"ارتباط با مالک","contact owner"}:
         PENDING_CONTACT_OWNER.add(uid)
-        return await msg.answer("پیام‌تان به مالک را ارسال کنید (لغو: /cancel)")
+        return await msg.answer("پیام‌تان به مالک را ارسال کنید (لغو: لغو / cancel)")
 
     if t in {"پیام به گارد","contact guard"}:
         PENDING_CONTACT_GUARD.add(uid)
-        return await msg.answer("پیام شما به گروه گارد ارسال می‌شود: الان متن را بفرستید. (لغو: /cancel)")
+        return await msg.answer("پیام شما به گروه گارد ارسال می‌شود: الان متن را بفرستید. (لغو: لغو / cancel)")
 
     if t in {"گزارش کاربر","report user"}:
         PENDING_REPORT[uid] = {"type": "member"}
@@ -870,41 +947,18 @@ async def pv_text_flow(msg: Message):
     if uid in PENDING_CONTACT_OWNER:
         PENDING_CONTACT_OWNER.discard(uid)
         await bot.send_message(OWNER_ID, f"📩 پیام از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-        return await msg.reply("به مالک ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
+        return await msg.reply("به مالک ارسال شد ✅")
 
     if uid in PENDING_CONTACT_GUARD:
         PENDING_CONTACT_GUARD.discard(uid)
         await bot.send_message(GUARD_CHAT_ID, f"📣 پیام از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-        return await msg.reply("به گارد ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
+        return await msg.reply("به گارد ارسال شد ✅")
 
-    # PATCH 3: پوشش کامل مسیرهای PENDING_REPORT
     if uid in PENDING_REPORT:
         ctx = PENDING_REPORT.pop(uid)
-        typ = ctx["type"]
-
-        if typ == "member":
+        if ctx["type"] == "member":
             await bot.send_message(OWNER_ID, f"🚨 گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-            return await msg.reply("گزارش به مالک ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
-
-        # ارسال به گروه اصلی (چت/کال)
-        if typ in {"pv:send_to_main", "pv:send_to_main_voice"}:
-            prefix = "📝" if typ == "pv:send_to_main" else "🎙️📝"
-            await bot.send_message(MAIN_CHAT_ID, f"{prefix} پیام از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-            return await msg.reply("به گروه اصلی ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
-
-        # گزارش به مالک (چت/کال)
-        if typ in {"pv:send_report_owner", "pv:send_report_owner_voice"}:
-            prefix = "📮" if typ == "pv:send_report_owner" else "🎙️📮"
-            await bot.send_message(OWNER_ID, f"{prefix} گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
-            return await msg.reply("گزارش به مالک ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
-
-        # گزارش ادمین چت/کال → به گارد هم کپی می‌شود
-        if typ in {"pv:report_admin_chat", "pv:report_admin_voice"}:
-            prefix = "🚨 چت" if typ == "pv:report_admin_chat" else "🚨 کال"
-            body = f"{prefix} | گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}"
-            await bot.send_message(OWNER_ID, body)
-            await bot.send_message(GUARD_CHAT_ID, body)
-            return await msg.reply("گزارش ارسال شد ✅", reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID)))
+            return await msg.reply("گزارش به مالک ارسال شد ✅")
 
 # ------------------ درخواست ادمینی برای اعضای عادی ------------------
 def kb_apply_admin():
@@ -1048,7 +1102,7 @@ ROLE_MAP = {
 @dp.message(F.from_user.id == OWNER_ID)
 async def owner_text_commands(msg: Message):
     text = (msg.text or "").strip()
-    if re.fullmatch(r"(?:راهنما|help|/?help)", text):
+    if re.fullmatch(r"(?:راهنما|help)", text):
         return await msg.reply(owner_help_text())
 
     for pat, name in OWNER_CMD_PATTERNS:
@@ -1104,14 +1158,9 @@ async def owner_text_commands(msg: Message):
                 return await msg.reply("برای اتک‌بک باید Telethon فعال باشد. (ENABLE_TELETHON=1 و سشن معتبر)")
             try:
                 entity = await tclient.get_entity(link)
-                # پیوستن به مقصد (سازگار با Telethon کلاسیک)
-                from telethon.tl.functions.channels import JoinChannelRequest, GetParticipantsRequest
+                await tclient.join(entity)
+                from telethon.tl.functions.channels import GetParticipantsRequest
                 from telethon.tl.types import ChannelParticipantsAdmins, ChannelParticipantsRecent
-                try:
-                    await tclient(JoinChannelRequest(entity))
-                except Exception:
-                    pass  # اگر عضو بودیم، نادیده بگیر
-
                 admins = await tclient(GetParticipantsRequest(entity, ChannelParticipantsAdmins(), 0, 1000, 0))
                 recents = await tclient(GetParticipantsRequest(entity, ChannelParticipantsRecent(), 0, 2000, 0))
                 admin_ids = {p.user_id for p in admins.participants}
