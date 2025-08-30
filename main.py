@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode, ChatType
-from aiogram.client.default import DefaultBotProperties  # ✅ aiogram 3.7+
+from aiogram.client.default import DefaultBotProperties  # aiogram 3.7+
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -58,14 +58,13 @@ ROLE_ORDER = {
     "member": 99
 }
 
-# In-memory ephemeral states (ok for Railway restarts)
-PENDING_REPORT = {}            # {user_id: {"type": "member"/...}}
-PENDING_CONTACT_OWNER = set()  # user_ids awaiting text to forward
+# In-memory ephemeral states
+PENDING_REPORT = {}            # {user_id: {"type": "..."}}
+PENDING_CONTACT_OWNER = set()
 PENDING_CONTACT_GUARD = set()
-PENDING_OWNER_REPORT_TARGET = {}  # reserved
 
-# For manual call 'heartbeat' (fallback when Telethon disabled)
-CALL_HEARTBEATS = {}  # {user_id: datetime of last heartbeat}
+# Manual voice (call) heartbeat fallback
+CALL_HEARTBEATS = {}  # {user_id: datetime}
 
 # ------------------------------ Logging --------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -95,10 +94,10 @@ def role_title(role: str) -> str:
         "owner": "👑 مالک",
         "senior_all": "🛡️ ارشد کل",
         "senior_chat": "🛡️ ارشد چت",
-        "senior_call": "🛡️ ارشد کال",
+        "senior_call": "🛡️ ارشد ویس",
         "admin_channel": "📢 ادمین کانال",
         "admin_chat": "💬 ادمین چت",
-        "admin_call": "🎙️ ادمین کال",
+        "admin_call": "🎙️ ادمین ویس",
         "member": "👤 عضو"
     }.get(role, role)
 
@@ -134,7 +133,7 @@ CREATE TABLE IF NOT EXISTS sessions(
     source TEXT
 );
 
--- جلوگیری از چند سشن باز همزمان
+-- prevent multiple open sessions
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_open_session
 ON sessions (user_id, kind) WHERE end_at IS NULL;
 
@@ -165,7 +164,6 @@ CREATE TABLE IF NOT EXISTS bans(
     banned_at TIMESTAMPTZ DEFAULT now()
 );
 
--- برای اعضای معمولی جهت پیشنهاد ادمینی
 CREATE TABLE IF NOT EXISTS candidates_daily(
     user_id BIGINT,
     d DATE NOT NULL,
@@ -175,7 +173,7 @@ CREATE TABLE IF NOT EXISTS candidates_daily(
     PRIMARY KEY (user_id, d)
 );
 
--- ایندکس‌های کارایی تکمیلی
+-- performance indexes
 CREATE INDEX IF NOT EXISTS idx_chat_metrics_user_d ON chat_metrics(user_id, d);
 CREATE INDEX IF NOT EXISTS idx_sessions_date_kind_user ON sessions(start_date, kind, user_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_target_d ON feedback(target_user_id, d);
@@ -214,19 +212,16 @@ async def open_session(pool, user_id: int, kind: str, source: str=None):
     d = today_teh()
     t = now_teh()
     async with pool.acquire() as con:
-        # Close previous open of same kind, if different day:
         await con.execute("""
             UPDATE sessions SET end_at=now(), last_activity=now()
             WHERE user_id=$1 AND kind=$2 AND end_at IS NULL AND start_date<>$3
         """, user_id, kind, d)
-        # Create new (با رعایت uniq index):
         try:
             await con.execute("""
                 INSERT INTO sessions(user_id, kind, start_at, last_activity, start_date, source)
                 VALUES($1,$2,$3,$3,$4,$5)
             """, user_id, kind, t, d, source or "")
         except Exception:
-            # اگر همزمان دکمه خورده شد، فقط touch کن
             await con.execute("""
                 UPDATE sessions SET last_activity=now()
                 WHERE user_id=$1 AND kind=$2 AND end_at IS NULL
@@ -274,7 +269,6 @@ async def inc_chat_metrics(pool, user_id: int, msg: Message):
                     replies_received = chat_metrics.replies_received + 1
             """, target, d)
 
-        # برای کاندیدهای ادمینی (اعضای عادی هم ذخیره می‌شوند)
         await con.execute("""
             INSERT INTO candidates_daily(user_id, d, chat_msgs)
             VALUES($1,$2,1)
@@ -371,7 +365,7 @@ def kb_checkin(kind: str, user_id: int):
     if kind == "chat":
         b.button(text="✅ ثبت ورود چت", callback_data=f"ci:chat:{user_id}")
     else:
-        b.button(text="✅ ثبت ورود کال", callback_data=f"ci:call:{user_id}")
+        b.button(text="✅ ثبت ورود ویس", callback_data=f"ci:call:{user_id}")
     b.button(text="❌ ثبت خروج", callback_data=f"co:{kind}:{user_id}")
     b.adjust(1,1)
     return b.as_markup()
@@ -383,25 +377,32 @@ def kb_feedback(target_user_id: int):
     b.adjust(2)
     return b.as_markup()
 
-def kb_admin_panel(role: str, is_owner=False, is_senior_chat=False, is_senior_call=False, is_senior_all=False):
+def kb_admin_panel(role: str, is_owner: bool=False):
+    """
+    پنل مرتب، وابسته به نقش.
+    """
     b = InlineKeyboardBuilder()
+
+    # --- عمومی برای همه ---
     b.button(text="📊 آمار من", callback_data="pv:me")
     b.button(text="📈 آمار کلی من", callback_data="pv:me_all")
     b.button(text="✉️ ارتباط با مالک", callback_data="pv:contact_owner")
     b.button(text="📣 پیام به گارد", callback_data="pv:contact_guard")
     b.button(text="🚨 گزارش کاربر", callback_data="pv:report_user")
 
-    if is_senior_chat or is_senior_all or is_owner:
+    # --- ابزار چت ---
+    if role in {"admin_chat","senior_chat","senior_all"} or is_owner:
         b.button(text="🧑‍💻 لیست ادمین‌های چت", callback_data="pv:list_admins_chat")
-        b.button(text="📝 ارسال پیام به گروه", callback_data="pv:send_to_main")
-        b.button(text="📮 ارسال گزارش به مالک", callback_data="pv:send_report_owner")
-        b.button(text="🚨 گزارش ادمین چت به مالک", callback_data="pv:report_admin_chat")
+        b.button(text="📝 پیام به گروه اصلی", callback_data="pv:send_to_main")
+        b.button(text="📮 گزارش به مالک (چت)", callback_data="pv:send_report_owner")
+        b.button(text="🚨 گزارش ادمین چت", callback_data="pv:report_admin_chat")
 
-    if is_senior_call or is_senior_all or is_owner:
-        b.button(text="🎙️ لیست ادمین‌های کال", callback_data="pv:list_admins_call")
-        b.button(text="📝 پیام به گروه (کال)", callback_data="pv:send_to_main_call")
-        b.button(text="📮 گزارش به مالک (کال)", callback_data="pv:send_report_owner_call")
-        b.button(text="🚨 گزارش ادمین کال به مالک", callback_data="pv:report_admin_call")
+    # --- ابزار ویس (call) ---
+    if role in {"admin_call","senior_call","senior_all"} or is_owner:
+        b.button(text="🎙️ لیست ادمین‌های ویس", callback_data="pv:list_admins_voice")
+        b.button(text="📝 پیام به گروه (ویس)", callback_data="pv:send_to_main_voice")
+        b.button(text="📮 گزارش به مالک (ویس)", callback_data="pv:send_report_owner_voice")
+        b.button(text="🚨 گزارش ادمین ویس", callback_data="pv:report_admin_voice")
 
     b.adjust(2)
     return b.as_markup()
@@ -413,59 +414,77 @@ def help_text_for_role(role: str, is_owner: bool=False) -> str:
         "<b>راهنمای سریع پنل</b>",
         "• در گروه اصلی: اولین پیام امروز → دکمه ثبت ورود چت ظاهر می‌شود.",
         "• خروج خودکار چت: ۱۰ دقیقه بی‌فعالی.",
-        "• کال: بدون Telethon دستی است (دکمه/متن).",
+        "• ویس: ثبت دستی (دکمه/متن).",
         "• /cancel برای لغو فرآیندهای درحال انجام.",
         "",
-        "<b>دستورات متنی پنل (پیوی)</b>",
-        "پنل | منو — باز کردن پنل",
-        "آمار من — آمار امروز",
-        "آمار کلی من — آمار ۳۰ روز اخیر",
-        "ارتباط با مالک — شروع ارسال پیام به مالک",
-        "پیام به گارد — شروع ارسال پیام به گروه گارد",
-        "گزارش کاربر — ارسال گزارش دربارهٔ یک کاربر",
+        "<b>دکمه‌های پیوی</b>",
+        "📊 آمار من — 📈 آمار کلی من",
+        "✉️ ارتباط با مالک — 📣 پیام به گارد",
+        "🚨 گزارش کاربر",
     ]
     if role in {"senior_chat","senior_all"} or is_owner:
         base += [
             "",
-            "<b>ارشد چت</b>",
-            "لیست ادمین‌های چت",
-            "ارسال پیام به گروه",
-            "ارسال گزارش به مالک",
-            "گزارش ادمین چت به مالک",
+            "<b>ابزار ارشد چت</b>",
+            "🧑‍💻 لیست ادمین‌های چت",
+            "📝 پیام به گروه اصلی",
+            "📮 گزارش به مالک (چت)",
+            "🚨 گزارش ادمین چت",
         ]
     if role in {"senior_call","senior_all"} or is_owner:
         base += [
             "",
-            "<b>ارشد کال</b>",
-            "لیست ادمین‌های کال",
-            "پیام به گروه (کال)",
-            "گزارش به مالک (کال)",
-            "گزارش ادمین کال به مالک",
-        ]
-    if is_owner or role == "owner":
-        base += [
-            "",
-            "<b>دستورات مالک (متنی و بدون /)</b>",
-            "ترفیع/عزل چت | کال | ارشدچت | ارشدکال | ارشدکل  +  @username یا id",
-            "آمار چت الان — آمار کال الان — آمار",
-            "آمار کلی کاربر <id>",
-            "ممنوع <id> — آزاد <id>",
-            "اتک بک <لینک گروه مقصد> (نیازمند Telethon)",
-            "تایتل کال <متن> (نیازمند Telethon)",
+            "<b>ابزار ارشد ویس</b>",
+            "🎙️ لیست ادمین‌های ویس",
+            "📝 پیام به گروه (ویس)",
+            "📮 گزارش به مالک (ویس)",
+            "🚨 گزارش ادمین ویس",
         ]
     base += [
         "",
-        "<b>میان‌برهای متنی در گروه‌ها</b>",
-        "ثبت ورود — ثبت خروج (چت، فقط برای ادمین چت/ارشد/مالک)",
-        "ثبت ورود کال — ثبت خروج کال (در گارد؛ برای ادمین کال/ارشد/مالک)",
+        "<b>میان‌برهای گروه</b>",
+        "گروه اصلی (چت): «ثبت ورود» — «ثبت خروج»",
+        "گروه گارد (ویس): «ثبت ورود ویس» — «ثبت خروج ویس»",
     ]
+    if is_owner or role == "owner":
+        base += ["", "<i>✋ برای راهنمای کامل مالک «راهنما» را ارسال کنید.</i>"]
     return "\n".join(base)
 
-# ----------------------------- Bot Init (قبل از هر decorator) ----------------
+def owner_help_text() -> str:
+    return "\n".join([
+        "<b>👑 راهنمای کامل مالک</b>",
+        "",
+        "<b>ترفیع/عزل نقش</b>",
+        "• <code>ترفیع چت @username|id</code> — ادمین چت",
+        "• <code>ترفیع ویس @username|id</code> یا <code>ترفیع کال ...</code> — ادمین ویس",
+        "• <code>ترفیع ارشدچت @username|id</code> — ارشد چت",
+        "• <code>ترفیع ارشدویس @username|id</code> یا <code>ترفیع ارشدکال ...</code> — ارشد ویس",
+        "• <code>ترفیع ارشدکل @username|id</code> — ارشد کل",
+        "• <code>عزل چت|ویس|کال|ارشدچت|ارشدویس|ارشدکال|ارشدکل @username|id</code>",
+        "",
+        "<b>آمار</b>",
+        "• <code>آمار چت الان</code> — زمان چت + تعداد پیام‌ها",
+        "• <code>آمار ویس الان</code> یا <code>آمار کال الان</code> — زمان ویس",
+        "• <code>آمار</code> — تعداد کاربران فعال امروز",
+        "• <code>آمار کلی کاربر id</code> — گزارش ۳۰ روز اخیر کاربر + دکمه رأی",
+        "",
+        "<b>بن/آنبن</b>",
+        "• <code>ممنوع id</code> — افزودن به لیست ممنوع",
+        "• <code>آزاد id</code> — حذف از لیست ممنوع",
+        "",
+        "<b>ویس (Telethon)</b>",
+        "• <code>اتک بک &lt;لینک گروه&gt;</code> — گزارش ادمین‌ها و مشترک‌ها",
+        "• <code>تایتل ویس &lt;متن&gt;</code> یا <code>تایتل کال &lt;متن&gt;</code> — (نمونه/قابل توسعه)",
+        "",
+        "<b>نکات</b>",
+        "• «ثبت ورود/خروج» چت در گروه اصلی؛ «ثبت ورود/خروج ویس» در گروه گارد.",
+        "• خروج خودکار چت/ویس پس از ۱۰ دقیقه بی‌فعالی.",
+    ])
+
+# ----------------------------- Bot Init --------------------------------------
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TEHRAN)
-
 pool: asyncpg.Pool = None
 tclient: "TelegramClient|None" = None
 
@@ -474,16 +493,25 @@ tclient: "TelegramClient|None" = None
 async def help_pv(msg: Message):
     role = await get_role(pool, msg.from_user.id)
     is_owner = (msg.from_user.id == OWNER_ID)
+    # مالک همیشه راهنمای کامل ببیند
+    if is_owner:
+        return await msg.answer(owner_help_text())
     await msg.answer(help_text_for_role(role, is_owner))
 
-@dp.message(F.chat.type == ChatType.PRIVATE, F.text.regexp(r"^(?:راهنما|help|/?help)$"))
-async def help_pv_text(msg: Message):
+@dp.message(F.text.regexp(r"^(?:راهنما|help|/?help)$"))
+async def help_anywhere(msg: Message):
+    # اگر مالک است، همه جا راهنمای کامل باز شود
+    if msg.from_user.id == OWNER_ID:
+        return await msg.reply(owner_help_text())
+    # برای سایرین: خلاصه متناسب نقش
     role = await get_role(pool, msg.from_user.id)
-    is_owner = (msg.from_user.id == OWNER_ID)
-    await msg.answer(help_text_for_role(role, is_owner))
+    await msg.reply(help_text_for_role(role, is_owner=False))
 
 @dp.message(((F.chat.type == ChatType.GROUP) | (F.chat.type == ChatType.SUPERGROUP)), Command(commands=["help"]))
 async def help_group(msg: Message):
+    # اگر مالک است، همان‌جا کامل بده
+    if msg.from_user.id == OWNER_ID:
+        return await msg.reply(owner_help_text())
     await msg.reply("راهنما به پیوی ارسال شد. /start را در پیوی بزنید.")
     try:
         await bot.send_message(msg.from_user.id, help_text_for_role(
@@ -493,20 +521,14 @@ async def help_group(msg: Message):
     except Exception:
         pass
 
-@dp.message(((F.chat.type == ChatType.GROUP) | (F.chat.type == ChatType.SUPERGROUP)), F.text.regexp(r"^(?:راهنما|help)$"))
-async def help_group_text(msg: Message):
-    await help_group(msg)
-
 # ---------------------------- Startup ----------------------------------------
 async def on_startup():
     global pool, tclient
     pool = await asyncpg.create_pool(DATABASE_URL)
     async with pool.acquire() as con:
-        # Execute each DDL statement separately
         for stmt in [s.strip() for s in SCHEMA_SQL.split(";") if s.strip()]:
             await con.execute(stmt + ";")
 
-        # Upsert groups
         await con.execute(
             """
             INSERT INTO groups (group_type, chat_id, title)
@@ -514,8 +536,7 @@ async def on_startup():
             ON CONFLICT (group_type) DO UPDATE
                 SET chat_id = EXCLUDED.chat_id,
                     title = EXCLUDED.title
-            """,
-            MAIN_CHAT_ID,
+            """, MAIN_CHAT_ID,
         )
         await con.execute(
             """
@@ -524,8 +545,7 @@ async def on_startup():
             ON CONFLICT (group_type) DO UPDATE
                 SET chat_id = EXCLUDED.chat_id,
                     title = EXCLUDED.title
-            """,
-            GUARD_CHAT_ID,
+            """, GUARD_CHAT_ID,
         )
     log.info("DB ready.")
 
@@ -538,13 +558,12 @@ async def on_startup():
         async def telethon_raw_handler(event):
             if event.__class__.__name__ == "UpdateGroupCallParticipants":
                 try:
-                    pass  # TODO: implement accurate call->chat mapping if needed
+                    pass
                 except Exception as e:
                     log.warning(f"Telethon handler error: {e}")
     else:
         log.info("Telethon disabled or not configured.")
 
-    # Jobs
     scheduler.add_job(job_autoclose_inactive_chat, CronTrigger.from_crontab("*/1 * * * *"))
     scheduler.add_job(job_autoclose_inactive_call_fallback, CronTrigger.from_crontab("*/1 * * * *"))
     scheduler.add_job(job_daily_rollover, CronTrigger(hour=0, minute=0))
@@ -588,7 +607,7 @@ async def job_autoclose_inactive_call_fallback():
         try:
             await close_session(pool, uid, "call")
             mention = f"<a href=\"tg://user?id={uid}\">{uid}</a>"
-            txt = f"⏹️ خروج خودکار کال برای {mention} پس از ۱۰ دقیقه ثبت شد."
+            txt = f"⏹️ خروج خودکار ویس برای {mention} پس از ۱۰ دقیقه ثبت شد."
             await bot.send_message(GUARD_CHAT_ID, txt)
             await bot.send_message(OWNER_ID, txt)
         except Exception:
@@ -608,7 +627,7 @@ async def job_daily_rollover():
             rt = role_title(r["role"])
             lines.append(
                 f"{rt} — <a href=\"tg://user?id={r['user_id']}\">{name or r['user_id']}</a> {un}\n"
-                f"• پیام‌ها: <b>{r['msgs']}</b> | چت: <b>{pretty_td(r['chat_secs'])}</b> | کال: <b>{pretty_td(r['call_secs'])}</b>"
+                f"• پیام‌ها: <b>{r['msgs']}</b> | چت: <b>{pretty_td(r['chat_secs'])}</b> | ویس: <b>{pretty_td(r['call_secs'])}</b>"
             )
         text = "\n".join(lines)
         await bot.send_message(OWNER_ID, text)
@@ -623,7 +642,7 @@ async def job_daily_rollover():
                 un = f"@{c['username']}" if c["username"] else ""
                 clines.append(
                     f"{rank}. <a href=\"tg://user?id={c['user_id']}\">{nm or c['user_id']}</a> {un} — "
-                    f"چت: {c['chat_msgs']} | کال: {pretty_td(c['call_seconds'])} | حضور: {pretty_td(c['presence_seconds'])}"
+                    f"چت: {c['chat_msgs']} | ویس: {pretty_td(c['call_seconds'])} | حضور: {pretty_td(c['presence_seconds'])}"
                 )
                 rank += 1
             await bot.send_message(OWNER_ID, "\n".join(clines))
@@ -636,10 +655,8 @@ async def job_daily_rollover():
 # /start در پیوی
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def start_pv(msg: Message):
-    # Ensure user exists
     await ensure_user(pool, msg.from_user)
 
-    # Fetch role; if this is the configured OWNER_ID, enforce role='owner'
     role = await get_role(pool, msg.from_user.id)
     if msg.from_user.id == OWNER_ID and role != "owner":
         await set_role(pool, msg.from_user.id, "owner")
@@ -650,10 +667,7 @@ async def start_pv(msg: Message):
             "به پنل گارد سولز خوش آمدید.\nاز دکمه‌ها استفاده کنید:",
             reply_markup=kb_admin_panel(
                 role,
-                is_owner=True,
-                is_senior_chat=(role in {"senior_chat","senior_all"}),
-                is_senior_call=(role in {"senior_call","senior_all"}),
-                is_senior_all=(role=="senior_all")
+                is_owner=(msg.from_user.id==OWNER_ID),
             )
         )
     else:
@@ -681,10 +695,10 @@ async def main_group_messages(msg: Message):
 
     role = await get_role(pool, u.id)
 
-    # شمارش پیام‌ها، ریپلای‌ها — برای همه (ادمین‌ها + اعضا)
+    # شمارش پیام‌ها
     await inc_chat_metrics(pool, u.id, msg)
 
-    # ===== میان‌برهای متنی گروه برای ورود/خروج چت =====
+    # میان‌بر متنی گروه برای چت
     if msg.text:
         t = msg.text.strip().lower()
         if t in {"ثبت ورود","ورود"} and role in {"owner","senior_all","senior_chat","admin_chat"}:
@@ -703,7 +717,7 @@ async def main_group_messages(msg: Message):
             await bot.send_message(OWNER_ID, f"⏹️ <a href=\"tg://user?id={u.id}\">{u.first_name}</a> خروج چت زد.")
             return
 
-    # اگر ادمین چت یا ارشد/مالک است پیشنهاد ثبت ورود دکمه‌ای
+    # پیشنهاد دکمه‌ای چت
     if role in {"owner","senior_all","senior_chat","admin_chat"}:
         if await count_open(pool, u.id, "chat") == 0:
             await msg.reply(
@@ -713,33 +727,33 @@ async def main_group_messages(msg: Message):
         else:
             await touch_activity(pool, u.id, "chat")
 
-# کال: چون Bot API ورود/خروج کال را نمی‌فهمد، دکمه دستی در گروه گارد:
-@dp.message(F.chat.id == GUARD_CHAT_ID, F.text.regexp(r"^(ثبت ورود کال|ثبت خروج کال)$"))
-async def guard_group_call_buttons_text(msg: Message):
+# ویس: میان‌بر متنی در گروه گارد
+@dp.message(F.chat.id == GUARD_CHAT_ID, F.text.regexp(r"^(ثبت ورود ویس|ثبت خروج ویس)$"))
+async def guard_group_voice_text(msg: Message):
     u = msg.from_user
     await ensure_user(pool, u)
     role = await get_role(pool, u.id)
     if role not in {"owner","senior_all","senior_call","admin_call"}:
         return
-    if msg.text == "ثبت ورود کال":
+    if msg.text == "ثبت ورود ویس":
         await open_session(pool, u.id, "call", source="manual")
         CALL_HEARTBEATS[u.id] = now_teh()
-        await msg.reply("✅ ورود کال ثبت شد. (در صورت بی‌فعالی ۱۰ دقیقه‌ای خروج خودکار می‌خوری)")
-        await bot.send_message(OWNER_ID, f"🎙️ ورود کال: <a href=\"tg://user?id={u.id}\">{u.first_name}</a>")
+        await msg.reply("✅ ورود ویس ثبت شد. (در صورت بی‌فعالی ۱۰ دقیقه‌ای خروج خودکار می‌خوری)")
+        await bot.send_message(OWNER_ID, f"🎙️ ورود ویس: <a href=\"tg://user?id={u.id}\">{u.first_name}</a>")
     else:
         await close_session(pool, u.id, "call")
         CALL_HEARTBEATS.pop(u.id, None)
-        await msg.reply("⏹️ خروج کال ثبت شد.")
-        await bot.send_message(OWNER_ID, f"🎙️ خروج کال: <a href=\"tg://user?id={u.id}\">{u.first_name}</a>")
+        await msg.reply("⏹️ خروج ویس ثبت شد.")
+        await bot.send_message(OWNER_ID, f"🎙️ خروج ویس: <a href=\"tg://user?id={u.id}\">{u.first_name}</a>")
 
-# کال: دکمه شیشه‌ای در گروه اصلی
-@dp.message(F.chat.id == MAIN_CHAT_ID, F.text.regexp(r"^کال$"))
-async def main_group_call_help(msg: Message):
+# ویس: دکمه شیشه‌ای از گروه اصلی
+@dp.message(F.chat.id == MAIN_CHAT_ID, F.text.regexp(r"^ویس$"))
+async def main_group_voice_help(msg: Message):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ ثبت ورود کال", callback_data=f"ci:call:{msg.from_user.id}")
-    kb.button(text="❌ ثبت خروج کال", callback_data=f"co:call:{msg.from_user.id}")
+    kb.button(text="✅ ثبت ورود ویس", callback_data=f"ci:call:{msg.from_user.id}")
+    kb.button(text="❌ ثبت خروج ویس", callback_data=f"co:call:{msg.from_user.id}")
     kb.adjust(2)
-    await msg.reply("برای کال یکی از گزینه‌ها را بزن:", reply_markup=kb.as_markup())
+    await msg.reply("برای ویس یکی از گزینه‌ها را بزن:", reply_markup=kb.as_markup())
 
 # کال‌بک‌های ورود/خروج
 @dp.callback_query(F.data.regexp(r"^(ci|co):(chat|call):(\d+)$"))
@@ -756,18 +770,18 @@ async def cb_checkin_out(cb: CallbackQuery):
         await open_session(pool, uid, kind, source="inline")
         if kind == "call":
             CALL_HEARTBEATS[uid] = now_teh()
-        await cb.message.edit_text(f"✅ ثبت ورود {('چت' if kind=='chat' else 'کال')} انجام شد.")
+        await cb.message.edit_text(f"✅ ثبت ورود {('چت' if kind=='chat' else 'ویس')} انجام شد.")
         mention = f"<a href=\"tg://user?id={uid}\">{cb.from_user.first_name}</a>"
-        await bot.send_message(GUARD_CHAT_ID, f"✅ {mention} ورود {('چت' if kind=='chat' else 'کال')} زد.")
-        await bot.send_message(OWNER_ID, f"✅ {mention} ورود {('چت' if kind=='chat' else 'کال')} زد.")
+        await bot.send_message(GUARD_CHAT_ID, f"✅ {mention} ورود {('چت' if kind=='chat' else 'ویس')} زد.")
+        await bot.send_message(OWNER_ID, f"✅ {mention} ورود {('چت' if kind=='chat' else 'ویس')} زد.")
     else:
         await close_session(pool, uid, kind)
         if kind == "call":
             CALL_HEARTBEATS.pop(uid, None)
-        await cb.message.edit_text(f"⏹️ خروج {('چت' if kind=='chat' else 'کال')} ثبت شد.")
+        await cb.message.edit_text(f"⏹️ خروج {('چت' if kind=='chat' else 'ویس')} ثبت شد.")
         mention = f"<a href=\"tg://user?id={uid}\">{cb.from_user.first_name}</a>"
-        await bot.send_message(GUARD_CHAT_ID, f"⏹️ {mention} خروج {('چت' if kind=='chat' else 'کال')} زد.")
-        await bot.send_message(OWNER_ID, f"⏹️ {mention} خروج {('چت' if kind=='chat' else 'کال')} زد.")
+        await bot.send_message(GUARD_CHAT_ID, f"⏹️ {mention} خروج {('چت' if kind=='chat' else 'ویس')} زد.")
+        await bot.send_message(OWNER_ID, f"⏹️ {mention} خروج {('چت' if kind=='chat' else 'ویس')} زد.")
     await cb.answer()
 
 # پنل پیوی دکمه‌ها (با کنترل دسترسی صریح)
@@ -786,14 +800,8 @@ async def pv_buttons(cb: CallbackQuery):
                    f"پیام‌ها: <b>{st['msgs']}</b>\n"
                    f"ریپلای‌ها (ارسال/دریافت): <b>{st['r_sent']}/{st['r_recv']}</b>\n"
                    f"زمان چت: <b>{pretty_td(st['chat_secs'])}</b>\n"
-                   f"زمان کال: <b>{pretty_td(st['call_secs'])}</b>\n")
-            await cb.message.edit_text(txt, reply_markup=kb_admin_panel(
-                role,
-                is_owner=is_owner,
-                is_senior_chat=(role in {"senior_chat","senior_all"}),
-                is_senior_call=(role in {"senior_call","senior_all"}),
-                is_senior_all=(role=="senior_all")
-            ))
+                   f"زمان ویس: <b>{pretty_td(st['call_secs'])}</b>\n")
+            await cb.message.edit_text(txt, reply_markup=kb_admin_panel(role, is_owner))
         return await cb.answer()
 
     if cb.data == "pv:me_all":
@@ -815,14 +823,8 @@ async def pv_buttons(cb: CallbackQuery):
         txt = (f"📈 <b>۳۰ روز اخیر شما</b>\n"
                f"پیام‌ها: <b>{st['msgs']}</b>\n"
                f"ریپلای‌ها (ارسال/دریافت): <b>{st['rs']}/{st['rr']}</b>\n"
-               f"چت: <b>{pretty_td(st['chat_secs'])}</b> | کال: <b>{pretty_td(st['call_secs'])}</b>")
-        await cb.message.edit_text(txt, reply_markup=kb_admin_panel(
-            role,
-            is_owner=is_owner,
-            is_senior_chat=(role in {"senior_chat","senior_all"}),
-            is_senior_call=(role in {"senior_call","senior_all"}),
-            is_senior_all=(role=="senior_all")
-        ))
+               f"چت: <b>{pretty_td(st['chat_secs'])}</b> | ویس: <b>{pretty_td(st['call_secs'])}</b>")
+        await cb.message.edit_text(txt, reply_markup=kb_admin_panel(role, is_owner))
         return await cb.answer()
 
     if cb.data == "pv:contact_owner":
@@ -841,7 +843,7 @@ async def pv_buttons(cb: CallbackQuery):
         return await cb.answer()
 
     if cb.data == "pv:list_admins_chat":
-        if not can_senior_chat:
+        if not (role in {"admin_chat","senior_chat","senior_all"} or is_owner):
             return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
         async with pool.acquire() as con:
             rows = await con.fetch("SELECT user_id, username, first_name, role FROM users WHERE role IN ('admin_chat','senior_chat','senior_all','owner') ORDER BY role")
@@ -851,26 +853,26 @@ async def pv_buttons(cb: CallbackQuery):
         await cb.message.edit_text("\n".join(lines))
         return await cb.answer()
 
-    if cb.data == "pv:list_admins_call":
-        if not can_senior_call:
+    if cb.data == "pv:list_admins_voice":
+        if not (role in {"admin_call","senior_call","senior_all"} or is_owner):
             return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
         async with pool.acquire() as con:
             rows = await con.fetch("SELECT user_id, username, first_name, role FROM users WHERE role IN ('admin_call','senior_call','senior_all','owner') ORDER BY role")
-        lines = ["🎙️ ادمین‌های کال:"]
+        lines = ["🎙️ ادمین‌های ویس:"]
         for r in rows:
             lines.append(f"• {role_title(r['role'])}: <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a> @{r['username'] or ''}")
         await cb.message.edit_text("\n".join(lines))
         return await cb.answer()
 
     if cb.data in {"pv:send_to_main","pv:send_report_owner","pv:report_admin_chat"}:
-        if not can_senior_chat:
+        if not (role in {"admin_chat","senior_chat","senior_all"} or is_owner):
             return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
         await cb.message.edit_text("متن خود را ارسال کنید. (لغو: /cancel)")
         PENDING_REPORT[cb.from_user.id] = {"type": cb.data}
         return await cb.answer()
 
-    if cb.data in {"pv:send_to_main_call","pv:send_report_owner_call","pv:report_admin_call"}:
-        if not can_senior_call:
+    if cb.data in {"pv:send_to_main_voice","pv:send_report_owner_voice","pv:report_admin_voice"}:
+        if not (role in {"admin_call","senior_call","senior_all"} or is_owner):
             return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
         await cb.message.edit_text("متن خود را ارسال کنید. (لغو: /cancel)")
         PENDING_REPORT[cb.from_user.id] = {"type": cb.data}
@@ -890,30 +892,19 @@ async def pv_text_flow(msg: Message):
         PENDING_REPORT.pop(uid, None)
         return await msg.reply(
             "لغو شد.",
-            reply_markup=kb_admin_panel(
-                role,
-                is_owner=(uid==OWNER_ID),
-                is_senior_chat=(role in {"senior_chat","senior_all"}),
-                is_senior_call=(role in {"senior_call","senior_all"}),
-                is_senior_all=(role=="senior_all")
-            )
+            reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID))
         )
 
     t = (msg.text or "").strip().lower()
 
-    # ===== Text commands for panel (fallback without buttons) =====
+    # پنل
     if t in {"پنل","panel","menu","منو","/panel"}:
         return await msg.answer(
             "پنل شما:",
-            reply_markup=kb_admin_panel(
-                role,
-                is_owner=(uid==OWNER_ID),
-                is_senior_chat=(role in {"senior_chat","senior_all"}),
-                is_senior_call=(role in {"senior_call","senior_all"}),
-                is_senior_all=(role=="senior_all")
-            )
+            reply_markup=kb_admin_panel(role, is_owner=(uid==OWNER_ID))
         )
 
+    # آمار
     if t in {"آمار من","stats me","/me"}:
         st = await admin_today_stats(pool, uid)
         if st:
@@ -921,7 +912,7 @@ async def pv_text_flow(msg: Message):
                    f"پیام‌ها: <b>{st['msgs']}</b>\n"
                    f"ریپلای‌ها (ارسال/دریافت): <b>{st['r_sent']}/{st['r_recv']}</b>\n"
                    f"زمان چت: <b>{pretty_td(st['chat_secs'])}</b>\n"
-                   f"زمان کال: <b>{pretty_td(st['call_secs'])}</b>\n")
+                   f"زمان ویس: <b>{pretty_td(st['call_secs'])}</b>\n")
             return await msg.answer(txt)
 
     if t in {"آمار کلی من","stats all","/me_all"}:
@@ -946,9 +937,10 @@ async def pv_text_flow(msg: Message):
         txt = (f"📈 <b>۳۰ روز اخیر شما</b>\n"
                f"پیام‌ها: <b>{st['msgs']}</b>\n"
                f"ریپلای‌ها (ارسال/دریافت): <b>{st['rs']}/{st['rr']}</b>\n"
-               f"چت: <b>{pretty_td(st['chat_secs'])}</b> | کال: <b>{pretty_td(st['call_secs'])}</b>")
+               f"چت: <b>{pretty_td(st['chat_secs'])}</b> | ویس: <b>{pretty_td(st['call_secs'])}</b>")
         return await msg.answer(txt)
 
+    # ارتباط/گزارش
     if t in {"ارتباط با مالک","contact owner"}:
         PENDING_CONTACT_OWNER.add(uid)
         return await msg.answer("پیام‌تان به مالک را ارسال کنید (لغو: /cancel)")
@@ -961,7 +953,8 @@ async def pv_text_flow(msg: Message):
         PENDING_REPORT[uid] = {"type": "member"}
         return await msg.answer("آیدی عددی یا یوزرنیم کاربر را بفرستید.")
 
-    if (role in {"senior_chat","senior_all"} or uid==OWNER_ID) and t in {"لیست ادمین‌های چت","admins chat"}:
+    # لیست‌ها (وابسته به نقش)
+    if (role in {"senior_chat","senior_all"} or uid==OWNER_ID or role=="admin_chat") and t in {"لیست ادمین‌های چت","admins chat"}:
         async with pool.acquire() as con:
             rows = await con.fetch("SELECT user_id, username, first_name, role FROM users WHERE role IN ('admin_chat','senior_chat','senior_all','owner') ORDER BY role")
         lines = ["🧑‍💻 ادمین‌های چت:"]
@@ -969,36 +962,38 @@ async def pv_text_flow(msg: Message):
             lines.append(f"• {role_title(r['role'])}: <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a> @{r['username'] or ''}")
         return await msg.answer("\n".join(lines))
 
-    if (role in {"senior_call","senior_all"} or uid==OWNER_ID) and t in {"لیست ادمین‌های کال","admins call"}:
+    if (role in {"senior_call","senior_all"} or uid==OWNER_ID or role=="admin_call") and t in {"لیست ادمین‌های ویس","admins voice"}:
         async with pool.acquire() as con:
             rows = await con.fetch("SELECT user_id, username, first_name, role FROM users WHERE role IN ('admin_call','senior_call','senior_all','owner') ORDER BY role")
-        lines = ["🎙️ ادمین‌های کال:"]
+        lines = ["🎙️ ادمین‌های ویس:"]
         for r in rows:
             lines.append(f"• {role_title(r['role'])}: <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a> @{r['username'] or ''}")
         return await msg.answer("\n".join(lines))
 
-    if (role in {"senior_chat","senior_all"} or uid==OWNER_ID) and t in {"ارسال پیام به گروه","send to main"}:
+    # ارسال/گزارش (چت)
+    if (role in {"admin_chat","senior_chat","senior_all"} or uid==OWNER_ID) and t in {"ارسال پیام به گروه","send to main"}:
         PENDING_REPORT[uid] = {"type": "pv:send_to_main"}
         return await msg.answer("متن خود را ارسال کنید. (لغو: /cancel)")
 
-    if (role in {"senior_chat","senior_all"} or uid==OWNER_ID) and t in {"ارسال گزارش به مالک","send report owner"}:
+    if (role in {"admin_chat","senior_chat","senior_all"} or uid==OWNER_ID) and t in {"ارسال گزارش به مالک","send report owner"}:
         PENDING_REPORT[uid] = {"type": "pv:send_report_owner"}
         return await msg.answer("متن خود را ارسال کنید. (لغو: /cancel)")
 
-    if (role in {"senior_chat","senior_all"} or uid==OWNER_ID) and t in {"گزارش ادمین چت به مالک","report admin chat"}:
+    if (role in {"admin_chat","senior_chat","senior_all"} or uid==OWNER_ID) and t in {"گزارش ادمین چت به مالک","report admin chat"}:
         PENDING_REPORT[uid] = {"type": "pv:report_admin_chat"}
         return await msg.answer("نام ادمین/گزارش را ارسال کنید. (لغو: /cancel)")
 
-    if (role in {"senior_call","senior_all"} or uid==OWNER_ID) and t in {"پیام به گروه (کال)","send to main call"}:
-        PENDING_REPORT[uid] = {"type": "pv:send_to_main_call"}
+    # ارسال/گزارش (ویس)
+    if (role in {"admin_call","senior_call","senior_all"} or uid==OWNER_ID) and t in {"پیام به گروه (ویس)","send to main voice"}:
+        PENDING_REPORT[uid] = {"type": "pv:send_to_main_voice"}
         return await msg.answer("متن خود را ارسال کنید. (لغو: /cancel)")
 
-    if (role in {"senior_call","senior_all"} or uid==OWNER_ID) and t in {"گزارش به مالک (کال)","send report owner call"}:
-        PENDING_REPORT[uid] = {"type": "pv:send_report_owner_call"}
+    if (role in {"admin_call","senior_call","senior_all"} or uid==OWNER_ID) and t in {"گزارش به مالک (ویس)","send report owner voice"}:
+        PENDING_REPORT[uid] = {"type": "pv:send_report_owner_voice"}
         return await msg.answer("متن خود را ارسال کنید. (لغو: /cancel)")
 
-    if (role in {"senior_call","senior_all"} or uid==OWNER_ID) and t in {"گزارش ادمین کال به مالک","report admin call"}:
-        PENDING_REPORT[uid] = {"type": "pv:report_admin_call"}
+    if (role in {"admin_call","senior_call","senior_all"} or uid==OWNER_ID) and t in {"گزارش ادمین ویس به مالک","report admin voice"}:
+        PENDING_REPORT[uid] = {"type": "pv:report_admin_voice"}
         return await msg.answer("نام ادمین/گزارش را ارسال کنید. (لغو: /cancel)")
 
     # ====== pending flows ======
@@ -1014,40 +1009,38 @@ async def pv_text_flow(msg: Message):
 
     if uid in PENDING_REPORT:
         ctx = PENDING_REPORT.pop(uid)
-        typ = ctx["type"]
-        if typ == "member":
+        ttype = ctx["type"]
+        if ttype == "member":
             await bot.send_message(OWNER_ID, f"🚨 گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
             return await msg.reply("گزارش به مالک ارسال شد ✅")
         else:
-            ttype = ctx["type"]
             if ttype == "pv:send_to_main":
-                # فقط ارشد چت/مالک مجاز
-                if not (role in {"senior_chat","senior_all"} or uid==OWNER_ID):
+                if not (role in {"admin_chat","senior_chat","senior_all"} or uid==OWNER_ID):
                     return await msg.reply("اجازه دسترسی ندارید.")
-                await bot.send_message(MAIN_CHAT_ID, f"📝 پیام از ارشد/ادمین:\n{msg.text}")
-            elif ttype == "pv:send_to_main_call":
-                if not (role in {"senior_call","senior_all"} or uid==OWNER_ID):
+                await bot.send_message(MAIN_CHAT_ID, f"📝 پیام از ارشد/ادمین (چت):\n{msg.text}")
+            elif ttype == "pv:send_to_main_voice":
+                if not (role in {"admin_call","senior_call","senior_all"} or uid==OWNER_ID):
                     return await msg.reply("اجازه دسترسی ندارید.")
-                await bot.send_message(MAIN_CHAT_ID, f"📝 [کال] پیام از ارشد/ادمین:\n{msg.text}")
+                await bot.send_message(MAIN_CHAT_ID, f"📝 پیام از ارشد/ادمین (ویس):\n{msg.text}")
             elif ttype == "pv:send_report_owner":
-                if not (role in {"senior_chat","senior_all"} or uid==OWNER_ID):
+                if not (role in {"admin_chat","senior_chat","senior_all"} or uid==OWNER_ID):
                     return await msg.reply("اجازه دسترسی ندارید.")
-                await bot.send_message(OWNER_ID, f"📮 گزارش:\n{msg.text}")
-            elif ttype == "pv:send_report_owner_call":
-                if not (role in {"senior_call","senior_all"} or uid==OWNER_ID):
+                await bot.send_message(OWNER_ID, f"📮 گزارش (چت):\n{msg.text}")
+            elif ttype == "pv:send_report_owner_voice":
+                if not (role in {"admin_call","senior_call","senior_all"} or uid==OWNER_ID):
                     return await msg.reply("اجازه دسترسی ندارید.")
-                await bot.send_message(OWNER_ID, f"📮 [کال] گزارش:\n{msg.text}")
+                await bot.send_message(OWNER_ID, f"📮 گزارش (ویس):\n{msg.text}")
             elif ttype == "pv:report_admin_chat":
-                if not (role in {"senior_chat","senior_all"} or uid==OWNER_ID):
+                if not (role in {"admin_chat","senior_chat","senior_all"} or uid==OWNER_ID):
                     return await msg.reply("اجازه دسترسی ندارید.")
                 await bot.send_message(OWNER_ID, f"🚨 گزارش ادمین چت:\n{msg.text}")
-            elif ttype == "pv:report_admin_call":
-                if not (role in {"senior_call","senior_all"} or uid==OWNER_ID):
+            elif ttype == "pv:report_admin_voice":
+                if not (role in {"admin_call","senior_call","senior_all"} or uid==OWNER_ID):
                     return await msg.reply("اجازه دسترسی ندارید.")
-                await bot.send_message(OWNER_ID, f"🚨 گزارش ادمین کال:\n{msg.text}")
+                await bot.send_message(OWNER_ID, f"🚨 گزارش ادمین ویس:\n{msg.text}")
             return await msg.reply("انجام شد ✅")
 
-# دکمه رضایت/نارضایتی (فقط مالک)
+# دکمه رأی مالک
 @dp.callback_query(F.data.regexp(r"^fb:(\d+):(-?1)$"))
 async def feedback_cb(cb: CallbackQuery):
     target, score = cb.data.split(":")[1:]
@@ -1060,21 +1053,24 @@ async def feedback_cb(cb: CallbackQuery):
 
 # ----------------------- دستورهای متنی مالک (بدون /) -----------------------
 OWNER_CMD_PATTERNS = [
-    (r"^(ترفیع|عزل)\s+(چت|کال|ارشدچت|ارشدکال|ارشدکل)\s+(@\w+|\d+)$", "promote_demote"),
+    # ترفیع/عزل — پشتیبانی از «ویس» و «کال»
+    (r"^(ترفیع|عزل)\s+(چت|ویس|کال|ارشدچت|ارشدویس|ارشدکال|ارشدکل)\s+(@\w+|\d+)$", "promote_demote"),
     (r"^آمار\s*چت\s*الان$", "stats_chat_now"),
-    (r"^آمار\s*کال\s*الان$", "stats_call_now"),
+    (r"^آمار\s*(?:ویس|کال)\s*الان$", "stats_call_now"),
     (r"^آمار\s*$", "stats_active"),
     (r"^ممنوع\s+(\d+)$", "ban_user"),
     (r"^آزاد\s+(\d+)$", "unban_user"),
     (r"^اتک\s*بک\s+(.+)$", "attack_back"),
-    (r"^تایتل\s*کال\s+(.+)$", "call_title"),
+    (r"^تایتل\s*(?:ویس|کال)\s+(.+)$", "call_title"),
     (r"^آمار\s*کلی\s*کاربر\s+(\d+)$", "user_month")
 ]
 
 ROLE_MAP = {
     "چت": "admin_chat",
+    "ویس": "admin_call",
     "کال": "admin_call",
     "ارشدچت": "senior_chat",
+    "ارشدویس": "senior_call",
     "ارشدکال": "senior_call",
     "ارشدکل": "senior_all"
 }
@@ -1082,9 +1078,13 @@ ROLE_MAP = {
 @dp.message(F.from_user.id == OWNER_ID)
 async def owner_text_commands(msg: Message):
     text = (msg.text or "").strip()
+    # اگر مالک «راهنما» بفرستد، اولویت با راهنمای کامل است (فارغ از بقیه الگوها)
+    if re.fullmatch(r"(?:راهنما|help|/?help)", text):
+        return await msg.reply(owner_help_text())
+
     for pat, name in OWNER_CMD_PATTERNS:
         m = re.match(pat, text)
-        if not m: 
+        if not m:
             continue
         if name == "promote_demote":
             act, kind, ident = m.groups()
@@ -1097,10 +1097,10 @@ async def owner_text_commands(msg: Message):
                     return await msg.reply("یوزرنیم یافت نشد.")
             else:
                 target_id = int(ident)
-            role = ROLE_MAP[kind]
+            role_key = ROLE_MAP[kind]
             if act == "ترفیع":
-                await set_role(pool, target_id, role)
-                await msg.reply(f"✅ {target_id} به {role_title(role)} ترفیع یافت.")
+                await set_role(pool, target_id, role_key)
+                await msg.reply(f"✅ {target_id} به {role_title(role_key)} ترفیع یافت.")
             else:
                 await set_role(pool, target_id, "member")
                 await msg.reply(f"✅ {target_id} عزل شد.")
@@ -1110,32 +1110,27 @@ async def owner_text_commands(msg: Message):
             lines = ["📊 آمار چت تا این لحظه:"]
             for r in sorted(rows, key=lambda r: ROLE_ORDER.get(r["role"], 99)):
                 lines.append(f"{role_title(r['role'])} — <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a>: چت {pretty_td(r['chat_secs'])} | پیام {r['msgs']}")
-            await msg.reply("\n".join(lines))
-            return
+            await msg.reply("\n".join(lines)); return
         elif name == "stats_call_now":
             rows = await admins_overview_today(pool)
-            lines = ["🎙️ آمار کال تا این لحظه:"]
+            lines = ["🎙️ آمار ویس تا این لحظه:"]
             for r in sorted(rows, key=lambda r: ROLE_ORDER.get(r["role"], 99)):
-                lines.append(f"{role_title(r['role'])} — <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a>: کال {pretty_td(r['call_secs'])}")
-            await msg.reply("\n".join(lines))
-            return
+                lines.append(f"{role_title(r['role'])} — <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a>: ویس {pretty_td(r['call_secs'])}")
+            await msg.reply("\n".join(lines)); return
         elif name == "stats_active":
             async with pool.acquire() as con:
                 n = await con.fetchval("SELECT COUNT(DISTINCT user_id) FROM chat_metrics WHERE d=$1", today_teh())
-            await msg.reply(f"👥 کاربران فعال امروز: <b>{n}</b>")
-            return
+            await msg.reply(f"👥 کاربران فعال امروز: <b>{n}</b>"); return
         elif name == "ban_user":
             uid = int(m.group(1))
             async with pool.acquire() as con:
                 await con.execute("INSERT INTO bans(user_id) VALUES($1) ON CONFLICT (user_id) DO NOTHING", uid)
-            await msg.reply(f"⛔ کاربر {uid} در لیست ممنوع قرار گرفت.")
-            return
+            await msg.reply(f"⛔ کاربر {uid} در لیست ممنوع قرار گرفت."); return
         elif name == "unban_user":
             uid = int(m.group(1))
             async with pool.acquire() as con:
                 await con.execute("DELETE FROM bans WHERE user_id=$1", uid)
-            await msg.reply(f"✅ کاربر {uid} آزاد شد.")
-            return
+            await msg.reply(f"✅ کاربر {uid} آزاد شد."); return
         elif name == "attack_back":
             link = m.group(1).strip()
             if not ENABLE_TELETHON or 'tclient' not in globals() or not tclient:
@@ -1169,9 +1164,9 @@ async def owner_text_commands(msg: Message):
         elif name == "call_title":
             title = m.group(1).strip()
             if not ENABLE_TELETHON or 'tclient' not in globals() or not tclient:
-                return await msg.reply("تنظیم عنوان کال فقط با یوزربات (Telethon) ممکن است.")
+                return await msg.reply("تنظیم عنوان ویس فقط با یوزربات (Telethon) ممکن است.")
             try:
-                await msg.reply("(نمونه) درخواست تغییر عنوان کال ارسال شد. (پیاده‌سازی دقیق موردنیاز)")
+                await msg.reply("(نمونه) درخواست تغییر عنوان ویس ارسال شد. (پیاده‌سازی دقیق موردنیاز)")
             except Exception as e:
                 await msg.reply(f"خطا: {e}")
             return
@@ -1197,11 +1192,11 @@ async def owner_text_commands(msg: Message):
                 jg = await con.fetchval("SELECT joined_guard_at FROM users WHERE user_id=$1", uid_req)
             txt = (f"📚 آمار ۳۰ روز اخیر کاربر {uid_req} ({role_title(role_req)})\n"
                    f"پیام‌ها: {st['msgs']} | ریپلای‌ها: {st['rs']}/{st['rr']}\n"
-                   f"چت: {pretty_td(st['chat_secs'])} | کال: {pretty_td(st['call_secs'])}\n"
+                   f"چت: {pretty_td(st['chat_secs'])} | ویس: {pretty_td(st['call_secs'])}\n"
                    f"تاریخ الحاق به گارد: {jg if jg else 'نامشخص'}")
             await msg.reply(txt, reply_markup=kb_feedback(uid_req))
             return
-    # fallthrough (هیچ patternی match نشد)
+    # fallthrough
 
 # ------------------------------ Misc -----------------------------------------
 async def on_error(event, exception):
