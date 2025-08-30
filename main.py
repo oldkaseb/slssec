@@ -524,10 +524,6 @@ async def job_daily_rollover():
 # ------------------------------ Handlers -------------------------------------
 
 # /start در PV
-@CommandStart()
-async def _start_filter(message: Message):
-    return True
-
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def start_pv(msg: Message):
     await ensure_user(pool, msg.from_user)
@@ -908,12 +904,12 @@ async def owner_text_commands(msg: Message):
     # fallthrough
 
 # ------------------------------ Misc -----------------------------------------
-@dp.errors()
 async def on_error(event, exception):
     log.error(f"Error: {exception}")
 
 # ------------------------------- RUN -----------------------------------------
 async def main():
+    dp.errors.register(on_error)
     await dp.start_polling(bot, allowed_updates=["message","callback_query","chat_member","my_chat_member"])
 
 if __name__ == "__main__":
