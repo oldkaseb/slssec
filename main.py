@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode, ChatType
+from aiogram.client.default import DefaultBotProperties  # ✅ NEW for aiogram 3.7+
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
@@ -354,6 +355,7 @@ async def add_feedback(pool, target_user: int, giver: int, score: int):
         """, target_user, giver, today_teh(), score)
 
 # ----------------------------- Keyboards -------------------------------------
+
 def kb_checkin(kind: str, user_id: int):
     b = InlineKeyboardBuilder()
     if kind == "chat":
@@ -364,12 +366,14 @@ def kb_checkin(kind: str, user_id: int):
     b.adjust(1,1)
     return b.as_markup()
 
+
 def kb_feedback(target_user_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="👍 راضی", callback_data=f"fb:{target_user_id}:1")
     b.button(text="👎 ناراضی", callback_data=f"fb:{target_user_id}:-1")
     b.adjust(2)
     return b.as_markup()
+
 
 def kb_admin_panel(role: str, is_owner=False, is_senior_chat=False, is_senior_call=False, is_senior_all=False):
     b = InlineKeyboardBuilder()
@@ -398,7 +402,8 @@ def kb_admin_panel(role: str, is_owner=False, is_senior_chat=False, is_senior_ca
     return b.as_markup()
 
 # ----------------------------- Bot Init --------------------------------------
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# ✅ FIX: use DefaultBotProperties for default parse_mode in aiogram >= 3.7
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 scheduler = AsyncIOScheduler(timezone=TEHRAN)
 
@@ -406,7 +411,6 @@ pool: asyncpg.Pool = None
 tclient: "TelegramClient|None" = None
 
 # ---------------------------- Startup ----------------------------------------
-@dp.startup()
 async def on_startup():
     global pool, tclient
     pool = await asyncpg.create_pool(DATABASE_URL)
@@ -414,22 +418,16 @@ async def on_startup():
         await con.execute(SCHEMA_SQL, MAIN_CHAT_ID, GUARD_CHAT_ID)
     log.info("DB ready.")
 
-    if ENABLE_TELETHON and API_ID and API_HASH and TELETHON_SESSION:
+    if ENABLE_TELETHON and 'API_ID' in globals() and 'API_HASH' in globals() and 'TELETHON_SESSION' in globals() and API_ID and API_HASH and TELETHON_SESSION:
         tclient = TelegramClient(StringSession(TELETHON_SESSION), API_ID, API_HASH)
         await tclient.start()
         log.info("Telethon userbot started.")
 
-        # Track group call participants (auto call sessions)
         @tclient.on(events.Raw)
         async def telethon_raw_handler(event):
-            # We listen for UpdateGroupCallParticipants
             if event.__class__.__name__ == "UpdateGroupCallParticipants":
-                # NOTE: Simplified; production needs mapping call->chat
-                # Here we can't easily resolve which chat's group call changed without extra API calls.
-                # We'll try best-effort: fetch participants and map by MAIN_CHAT_ID.
                 try:
-                    # TODO: implement accurate call->chat mapping if needed
-                    pass
+                    pass  # TODO: implement accurate call->chat mapping if needed
                 except Exception as e:
                     log.warning(f"Telethon handler error: {e}")
 
@@ -441,6 +439,11 @@ async def on_startup():
     scheduler.add_job(job_daily_rollover, CronTrigger(hour=0, minute=0))
     scheduler.start()
     log.info("Scheduler started.")
+
+# Register startup handler in aiogram 3.x safe way
+from aiogram import Router
+
+dp.startup.register(on_startup)
 
 # --------------------- Jobs (auto-close & daily report) ----------------------
 async def job_autoclose_inactive_chat():
@@ -467,7 +470,6 @@ async def job_autoclose_inactive_chat():
         log.error(f"job_autoclose_inactive_chat: {e}")
 
 async def job_autoclose_inactive_call_fallback():
-    # Only when Telethon disabled; we rely on manual heartbeat concept
     if ENABLE_TELETHON:
         return
     now = now_teh()
@@ -487,12 +489,10 @@ async def job_autoclose_inactive_call_fallback():
         CALL_HEARTBEATS.pop(uid, None)
 
 async def job_daily_rollover():
-    # بستـن روز & ارسال گزارش کلی به مالک و گارد
     try:
         rows = await admins_overview_today(pool)
         if not rows: return
         lines = ["📊 <b>آمار امروز ادمین‌ها</b>\n(از ۰۰:۰۰ تا اکنون به وقت تهران)\n"]
-        # sort by role order
         rows_sorted = sorted(rows, key=lambda r: (ROLE_ORDER.get(r["role"], 999), -r["msgs"], -r["call_secs"]))
         for r in rows_sorted:
             name = r["first_name"] or ""
@@ -506,7 +506,6 @@ async def job_daily_rollover():
         await bot.send_message(OWNER_ID, text)
         await bot.send_message(GUARD_CHAT_ID, text)
 
-        # کاندیدهای ادمینی (۷ روز اخیر)
         cands = await top_candidates(pool, 10, 7)
         if cands:
             clines = ["🏆 <b>۱۰ عضو برتر (۷ روز اخیر)</b>"]
@@ -525,6 +524,10 @@ async def job_daily_rollover():
 # ------------------------------ Handlers -------------------------------------
 
 # /start در PV
+@CommandStart()
+async def _start_filter(message: Message):
+    return True
+
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def start_pv(msg: Message):
     await ensure_user(pool, msg.from_user)
@@ -570,14 +573,12 @@ async def main_group_messages(msg: Message):
 
     # اگر ادمین چت یا ارشد/مالک است پیشنهاد ثبت ورود
     if role in {"owner","senior_all","senior_chat","admin_chat"}:
-        # اگر امروز سشن باز چت ندارد، دکمه بده
         if await count_open(pool, u.id, "chat") == 0:
             await msg.reply(
                 f"اولین پیام امروز ثبت شد. {u.first_name} عزیز، ورود/خروج چت را ثبت کنید:",
                 reply_markup=kb_checkin("chat", u.id)
             )
         else:
-            # لمس فعالیت
             await touch_activity(pool, u.id, "chat")
 
 # کال: چون Bot API ورود/خروج کال را نمی‌فهمد، دکمه دستی در گروه گارد:
@@ -624,7 +625,6 @@ async def cb_checkin_out(cb: CallbackQuery):
         if kind == "call":
             CALL_HEARTBEATS[uid] = now_teh()
         await cb.message.edit_text(f"✅ ثبت ورود {('چت' if kind=='chat' else 'کال')} انجام شد.")
-        # Notify
         mention = f"<a href=\"tg://user?id={uid}\">{cb.from_user.first_name}</a>"
         await bot.send_message(GUARD_CHAT_ID, f"✅ {mention} ورود {('چت' if kind=='chat' else 'کال')} زد.")
         await bot.send_message(OWNER_ID, f"✅ {mention} ورود {('چت' if kind=='chat' else 'کال')} زد.")
@@ -659,7 +659,6 @@ async def pv_buttons(cb: CallbackQuery):
                 is_senior_all=(role=="senior_all")
             ))
     elif cb.data == "pv:me_all":
-        # ساده: مجموع ۳۰ روز اخیر
         async with pool.acquire() as con:
             st = await con.fetchrow("""
                 WITH cm AS (
@@ -735,11 +734,9 @@ async def pv_text_flow(msg: Message):
         ctx = PENDING_REPORT.pop(uid)
         typ = ctx["type"]
         if typ == "member":
-            # اینجا به مالک فوروارد کن
             await bot.send_message(OWNER_ID, f"🚨 گزارش از <a href=\"tg://user?id={uid}\">{msg.from_user.first_name}</a>:\n{msg.text}")
             return await msg.reply("گزارش به مالک ارسال شد ✅")
         else:
-            # انواع دیگر مثل pv:send_to_main, ...
             t = ctx["type"]
             if t == "pv:send_to_main":
                 await bot.send_message(MAIN_CHAT_ID, f"📝 پیام از ارشد/ادمین:\n{msg.text}")
@@ -768,20 +765,14 @@ async def feedback_cb(cb: CallbackQuery):
 
 # ----------------------- دستورهای متنی مالک (بدون /) -----------------------
 OWNER_CMD_PATTERNS = [
-    # ترفیع / عزل
     (r"^(ترفیع|عزل)\s+(چت|کال|ارشدچت|ارشدکال|ارشدکل)\s+(@\w+|\d+)$", "promote_demote"),
-    # آمار چت الان
     (r"^آمار\s*چت\s*الان$", "stats_chat_now"),
     (r"^آمار\s*کال\s*الان$", "stats_call_now"),
     (r"^آمار\s*$", "stats_active"),
-    # ممنوع/آزاد
     (r"^ممنوع\s+(\d+)$", "ban_user"),
     (r"^آزاد\s+(\d+)$", "unban_user"),
-    # اتک بک + لینک
     (r"^اتک\s*بک\s+(.+)$", "attack_back"),
-    # تایتل کال + متن
     (r"^تایتل\s*کال\s+(.+)$", "call_title"),
-    # آمار کلی کاربر + id
     (r"^آمار\s*کلی\s*کاربر\s+(\d+)$", "user_month")
 ]
 
@@ -801,7 +792,6 @@ async def owner_text_commands(msg: Message):
         if not m: continue
         if name == "promote_demote":
             act, kind, ident = m.groups()
-            # resolve user id
             target_id = None
             if ident.startswith("@"):
                 try:
@@ -834,7 +824,6 @@ async def owner_text_commands(msg: Message):
             await msg.reply("\n".join(lines))
             return
         elif name == "stats_active":
-            # تعداد کاربران فعال گروه اصلی امروز (پیام داده‌اند)
             async with pool.acquire() as con:
                 n = await con.fetchval("SELECT COUNT(DISTINCT user_id) FROM chat_metrics WHERE d=$1", today_teh())
             await msg.reply(f"👥 کاربران فعال امروز: <b>{n}</b>")
@@ -853,24 +842,20 @@ async def owner_text_commands(msg: Message):
             return
         elif name == "attack_back":
             link = m.group(1).strip()
-            if not ENABLE_TELETHON or not tclient:
+            if not ENABLE_TELETHON or 'tclient' not in globals() or not tclient:
                 return await msg.reply("برای اتک‌بک باید Telethon فعال باشد. (ENABLE_TELETHON=1 و سشن معتبر)")
             try:
                 entity = await tclient.get_entity(link)
                 await tclient.join(entity)
-                # دریافت اعضای ادمین و مشترکین
-                # توجه: نمونه‌ی ساده؛ در عمل نیاز به پیمایش صفحات participants دارد
                 from telethon.tl.functions.channels import GetParticipantsRequest
                 from telethon.tl.types import ChannelParticipantsAdmins, ChannelParticipantsRecent
                 admins = await tclient(GetParticipantsRequest(entity, ChannelParticipantsAdmins(), 0, 1000, 0))
                 recents = await tclient(GetParticipantsRequest(entity, ChannelParticipantsRecent(), 0, 2000, 0))
                 admin_ids = {p.user_id for p in admins.participants}
                 target_ids = {p.user_id for p in recents.participants}
-                # اعضای گروه اصلی ما (تقریبی: از DB کسانی که پیام داده‌اند)
                 async with pool.acquire() as con:
                     main_ids = {r["user_id"] for r in await con.fetch("SELECT DISTINCT user_id FROM chat_metrics")}
                 commons = target_ids & main_ids
-                # ارسال گزارش
                 lines = ["🛡️ گزارش اتک اخیر:"]
                 if admin_ids:
                     lines.append("• مقام‌داران مقصد:")
@@ -887,11 +872,9 @@ async def owner_text_commands(msg: Message):
             return
         elif name == "call_title":
             title = m.group(1).strip()
-            # Bot API عنوان ویس‌کال را مستقیم نمی‌تواند عوض کند؛ با Telethon ممکن است
-            if not ENABLE_TELETHON or not tclient:
+            if not ENABLE_TELETHON or 'tclient' not in globals() or not tclient:
                 return await msg.reply("تنظیم عنوان کال فقط با یوزربات (Telethon) ممکن است.")
             try:
-                # TODO: یافتن group call و تنظیم عنوان — نیاز به پیاده‌سازی دقیق با TL
                 await msg.reply("(نمونه) درخواست تغییر عنوان کال ارسال شد. (پیاده‌سازی دقیق موردنیاز)")
             except Exception as e:
                 await msg.reply(f"خطا: {e}")
@@ -922,7 +905,7 @@ async def owner_text_commands(msg: Message):
                    f"تاریخ الحاق به گارد: {jg if jg else 'نامشخص'}")
             await msg.reply(txt, reply_markup=kb_feedback(uid))
             return
-    # اگر هیچ پترنی نخورد، عبور
+    # fallthrough
 
 # ------------------------------ Misc -----------------------------------------
 @dp.errors()
