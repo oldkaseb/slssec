@@ -5,7 +5,6 @@ import asyncio
 import logging
 import os
 import re
-from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
@@ -15,8 +14,7 @@ from aiogram.enums import ParseMode, ChatType
 from aiogram.client.default import DefaultBotProperties  # aiogram 3.7+
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardRemove
+    Message, CallbackQuery, ReplyKeyboardRemove
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -56,6 +54,15 @@ ROLE_ORDER = {
     "admin_chat": 5,
     "admin_call": 6,
     "member": 99
+}
+
+# مجوز نقش‌ها برای دکمه‌های ورود
+ALLOWED_VOICE_ROLES = {
+    "owner", "senior_all", "senior_call", "admin_call",
+    "senior_chat", "admin_chat",  # چتی‌ها هم اجازه دارند
+}
+ALLOWED_CHAT_ROLES = {
+    "owner", "senior_all", "senior_chat", "admin_chat"
 }
 
 # In-memory ephemeral states
@@ -370,6 +377,13 @@ def kb_checkin(kind: str, user_id: int):
     b.adjust(1,1)
     return b.as_markup()
 
+def kb_first_msg_dual_checkin(user_id: int):
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ ثبت ورود چت",  callback_data=f"ci:chat:{user_id}")
+    b.button(text="✅ ثبت ورود ویس", callback_data=f"ci:call:{user_id}")
+    b.adjust(2)
+    return b.as_markup()
+
 def kb_feedback(target_user_id: int):
     b = InlineKeyboardBuilder()
     b.button(text="👍 راضی", callback_data=f"fb:{target_user_id}:1")
@@ -412,7 +426,7 @@ def kb_admin_panel(role: str, is_owner: bool=False):
 def help_text_for_role(role: str, is_owner: bool=False) -> str:
     base = [
         "<b>راهنمای سریع پنل</b>",
-        "• در گروه اصلی: اولین پیام امروز → دکمه ثبت ورود چت ظاهر می‌شود.",
+        "• در گروه اصلی: اولین پیام امروز → دکمه‌های «ثبت ورود چت» و «ثبت ورود ویس».",
         "• خروج خودکار چت: ۱۰ دقیقه بی‌فعالی.",
         "• ویس: ثبت دستی (دکمه/متن).",
         "• /cancel برای لغو فرآیندهای درحال انجام.",
@@ -477,6 +491,7 @@ def owner_help_text() -> str:
         "• <code>تایتل ویس &lt;متن&gt;</code> یا <code>تایتل کال &lt;متن&gt;</code> — (نمونه/قابل توسعه)",
         "",
         "<b>نکات</b>",
+        "• پیام اول امروز در گروه اصلی → دکمه‌های ورود چت/ویس.",
         "• «ثبت ورود/خروج» چت در گروه اصلی؛ «ثبت ورود/خروج ویس» در گروه گارد.",
         "• خروج خودکار چت/ویس پس از ۱۰ دقیقه بی‌فعالی.",
     ])
@@ -493,23 +508,19 @@ tclient: "TelegramClient|None" = None
 async def help_pv(msg: Message):
     role = await get_role(pool, msg.from_user.id)
     is_owner = (msg.from_user.id == OWNER_ID)
-    # مالک همیشه راهنمای کامل ببیند
     if is_owner:
         return await msg.answer(owner_help_text())
     await msg.answer(help_text_for_role(role, is_owner))
 
 @dp.message(F.text.regexp(r"^(?:راهنما|help|/?help)$"))
 async def help_anywhere(msg: Message):
-    # اگر مالک است، همه جا راهنمای کامل باز شود
     if msg.from_user.id == OWNER_ID:
         return await msg.reply(owner_help_text())
-    # برای سایرین: خلاصه متناسب نقش
     role = await get_role(pool, msg.from_user.id)
     await msg.reply(help_text_for_role(role, is_owner=False))
 
 @dp.message(((F.chat.type == ChatType.GROUP) | (F.chat.type == ChatType.SUPERGROUP)), Command(commands=["help"]))
 async def help_group(msg: Message):
-    # اگر مالک است، همان‌جا کامل بده
     if msg.from_user.id == OWNER_ID:
         return await msg.reply(owner_help_text())
     await msg.reply("راهنما به پیوی ارسال شد. /start را در پیوی بزنید.")
@@ -695,13 +706,13 @@ async def main_group_messages(msg: Message):
 
     role = await get_role(pool, u.id)
 
-    # شمارش پیام‌ها
+    # شمارش پیام‌ها، ریپلای‌ها — برای همه (ادمین‌ها + اعضا)
     await inc_chat_metrics(pool, u.id, msg)
 
-    # میان‌بر متنی گروه برای چت
+    # ===== میان‌برهای متنی گروه برای ورود/خروج چت =====
     if msg.text:
         t = msg.text.strip().lower()
-        if t in {"ثبت ورود","ورود"} and role in {"owner","senior_all","senior_chat","admin_chat"}:
+        if t in {"ثبت ورود","ورود"} and role in ALLOWED_CHAT_ROLES:
             if await count_open(pool, u.id, "chat") == 0:
                 await open_session(pool, u.id, "chat", source="text_group")
                 await msg.reply("✅ ورود چت ثبت شد.")
@@ -710,22 +721,34 @@ async def main_group_messages(msg: Message):
             else:
                 await msg.reply("سشن چت باز داری.")
             return
-        if t in {"ثبت خروج","خروج"} and role in {"owner","senior_all","senior_chat","admin_chat"}:
+        if t in {"ثبت خروج","خروج"} and role in ALLOWED_CHAT_ROLES:
             await close_session(pool, u.id, "chat")
             await msg.reply("⏹️ خروج چت ثبت شد.")
             await bot.send_message(GUARD_CHAT_ID, f"⏹️ <a href=\"tg://user?id={u.id}\">{u.first_name}</a> خروج چت زد.")
             await bot.send_message(OWNER_ID, f"⏹️ <a href=\"tg://user?id={u.id}\">{u.first_name}</a> خروج چت زد.")
             return
 
-    # پیشنهاد دکمه‌ای چت
-    if role in {"owner","senior_all","senior_chat","admin_chat"}:
-        if await count_open(pool, u.id, "chat") == 0:
-            await msg.reply(
-                f"اولین پیام امروز ثبت شد. {u.first_name} عزیز، ورود/خروج چت را ثبت کنید:",
-                reply_markup=kb_checkin("chat", u.id)
-            )
-        else:
-            await touch_activity(pool, u.id, "chat")
+    # ===== پیشنهاد خودکار با «اولین پیام امروز» =====
+    try:
+        async with pool.acquire() as con:
+            todays_msgs = await con.fetchval(
+                "SELECT msgs FROM chat_metrics WHERE user_id=$1 AND d=$2",
+                u.id, today_teh()
+            ) or 0
+        is_first_msg_today = (todays_msgs == 1)
+    except Exception:
+        is_first_msg_today = False
+
+    # فقط روی اولین پیام امروز و برای نقش‌های مجاز؛ دو دکمه ورود (بدون خروج)
+    if is_first_msg_today and (role in ALLOWED_CHAT_ROLES or role in ALLOWED_VOICE_ROLES):
+        return await msg.reply(
+            f"اولین پیام امروز ثبت شد. {u.first_name} عزیز، یکی از گزینه‌ها را بزن:",
+            reply_markup=kb_first_msg_dual_checkin(u.id)
+        )
+
+    # اگر سشن چت باز دارد، لمس فعالیت برای جلوگیری از خروج خودکار
+    if role in ALLOWED_CHAT_ROLES and await count_open(pool, u.id, "chat") > 0:
+        await touch_activity(pool, u.id, "chat")
 
 # ویس: میان‌بر متنی در گروه گارد
 @dp.message(F.chat.id == GUARD_CHAT_ID, F.text.regexp(r"^(ثبت ورود ویس|ثبت خروج ویس)$"))
@@ -733,7 +756,7 @@ async def guard_group_voice_text(msg: Message):
     u = msg.from_user
     await ensure_user(pool, u)
     role = await get_role(pool, u.id)
-    if role not in {"owner","senior_all","senior_call","admin_call"}:
+    if role not in ALLOWED_VOICE_ROLES:
         return
     if msg.text == "ثبت ورود ویس":
         await open_session(pool, u.id, "call", source="manual")
@@ -746,16 +769,19 @@ async def guard_group_voice_text(msg: Message):
         await msg.reply("⏹️ خروج ویس ثبت شد.")
         await bot.send_message(OWNER_ID, f"🎙️ خروج ویس: <a href=\"tg://user?id={u.id}\">{u.first_name}</a>")
 
-# ویس: دکمه شیشه‌ای از گروه اصلی
+# ویس: دکمه شیشه‌ای از گروه اصلی (اختیاری با پیام "ویس")
 @dp.message(F.chat.id == MAIN_CHAT_ID, F.text.regexp(r"^ویس$"))
 async def main_group_voice_help(msg: Message):
+    role = await get_role(pool, msg.from_user.id)
+    if role not in ALLOWED_VOICE_ROLES:
+        return await msg.reply("این بخش مخصوص ادمین‌های چت/ویس، ارشدها و مالک است.")
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ ثبت ورود ویس", callback_data=f"ci:call:{msg.from_user.id}")
     kb.button(text="❌ ثبت خروج ویس", callback_data=f"co:call:{msg.from_user.id}")
     kb.adjust(2)
     await msg.reply("برای ویس یکی از گزینه‌ها را بزن:", reply_markup=kb.as_markup())
 
-# کال‌بک‌های ورود/خروج
+# کال‌بک‌های ورود/خروج (با کنترل نقش برای ویس)
 @dp.callback_query(F.data.regexp(r"^(ci|co):(chat|call):(\d+)$"))
 async def cb_checkin_out(cb: CallbackQuery):
     action, kind, uid = cb.data.split(":")
@@ -764,9 +790,14 @@ async def cb_checkin_out(cb: CallbackQuery):
         return await cb.answer("این دکمه مخصوص همان کاربر/مالک است.", show_alert=True)
     await ensure_user(pool, cb.from_user)
 
+    if kind == "call":
+        role = await get_role(pool, cb.from_user.id)
+        if role not in ALLOWED_VOICE_ROLES and cb.from_user.id != OWNER_ID:
+            return await cb.answer("اجازه دسترسی ندارید.", show_alert=True)
+
     if action == "ci":
         if await count_open(pool, uid, kind) > 0:
-            await cb.answer("سشن باز داری.", show_alert=True); return
+            await cb.answer("सشن باز داری.", show_alert=True); return
         await open_session(pool, uid, kind, source="inline")
         if kind == "call":
             CALL_HEARTBEATS[uid] = now_teh()
@@ -790,8 +821,6 @@ async def pv_buttons(cb: CallbackQuery):
     await ensure_user(pool, cb.from_user)
     role = await get_role(pool, cb.from_user.id)
     is_owner = (cb.from_user.id == OWNER_ID)
-    can_senior_chat = role in {"senior_chat","senior_all"} or is_owner
-    can_senior_call = role in {"senior_call","senior_all"} or is_owner
 
     if cb.data == "pv:me":
         st = await admin_today_stats(pool, cb.from_user.id)
@@ -1053,7 +1082,6 @@ async def feedback_cb(cb: CallbackQuery):
 
 # ----------------------- دستورهای متنی مالک (بدون /) -----------------------
 OWNER_CMD_PATTERNS = [
-    # ترفیع/عزل — پشتیبانی از «ویس» و «کال»
     (r"^(ترفیع|عزل)\s+(چت|ویس|کال|ارشدچت|ارشدویس|ارشدکال|ارشدکل)\s+(@\w+|\d+)$", "promote_demote"),
     (r"^آمار\s*چت\s*الان$", "stats_chat_now"),
     (r"^آمار\s*(?:ویس|کال)\s*الان$", "stats_call_now"),
@@ -1078,7 +1106,6 @@ ROLE_MAP = {
 @dp.message(F.from_user.id == OWNER_ID)
 async def owner_text_commands(msg: Message):
     text = (msg.text or "").strip()
-    # اگر مالک «راهنما» بفرستد، اولویت با راهنمای کامل است (فارغ از بقیه الگوها)
     if re.fullmatch(r"(?:راهنما|help|/?help)", text):
         return await msg.reply(owner_help_text())
 
