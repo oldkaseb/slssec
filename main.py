@@ -104,6 +104,7 @@ def role_title(role: str) -> str:
 
 # ----------------------------- Database --------------------------------------
 SCHEMA_SQL = """
+-- DDL ONLY (no parameterized statements here)
 CREATE TABLE IF NOT EXISTS users(
     user_id BIGINT PRIMARY KEY,
     username TEXT,
@@ -121,14 +122,6 @@ CREATE TABLE IF NOT EXISTS groups(
     chat_id BIGINT,
     title TEXT
 );
-
-INSERT INTO groups (group_type, chat_id, title)
-VALUES ('main', $1, 'souls')
-ON CONFLICT (group_type) DO UPDATE SET chat_id=EXCLUDED.chat_id;
-
-INSERT INTO groups (group_type, chat_id, title)
-VALUES ('guard', $2, 'souls guard')
-ON CONFLICT (group_type) DO UPDATE SET chat_id=EXCLUDED.chat_id;
 
 CREATE TABLE IF NOT EXISTS sessions(
     id BIGSERIAL PRIMARY KEY,
@@ -415,7 +408,31 @@ async def on_startup():
     global pool, tclient
     pool = await asyncpg.create_pool(DATABASE_URL)
     async with pool.acquire() as con:
-        await con.execute(SCHEMA_SQL, MAIN_CHAT_ID, GUARD_CHAT_ID)
+        # Execute each DDL statement separately to avoid asyncpg prepared-statement limitation
+for stmt in [s.strip() for s in SCHEMA_SQL.split(";") if s.strip()]:
+    await con.execute(stmt + ";")
+
+# Upsert groups with parameters separately
+await con.execute(
+    """
+    INSERT INTO groups (group_type, chat_id, title)
+    VALUES ('main', $1, 'souls')
+    ON CONFLICT (group_type) DO UPDATE
+        SET chat_id = EXCLUDED.chat_id,
+            title = EXCLUDED.title
+    """,
+    MAIN_CHAT_ID,
+)
+await con.execute(
+    """
+    INSERT INTO groups (group_type, chat_id, title)
+    VALUES ('guard', $1, 'souls guard')
+    ON CONFLICT (group_type) DO UPDATE
+        SET chat_id = EXCLUDED.chat_id,
+            title = EXCLUDED.title
+    """,
+    GUARD_CHAT_ID,
+)
     log.info("DB ready.")
 
     if ENABLE_TELETHON and 'API_ID' in globals() and 'API_HASH' in globals() and 'TELETHON_SESSION' in globals() and API_ID and API_HASH and TELETHON_SESSION:
