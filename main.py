@@ -109,9 +109,6 @@ def role_title(role: str) -> str:
 def src_tag(chat_id: int) -> str:
     return f"src:{chat_id}"
 
-def has_main_src(source: str) -> bool:
-    return source and (src_tag(MAIN_CHAT_ID) in source)
-
 def uptime_str() -> str:
     d = datetime.utcnow() - STARTED_AT
     s = int(d.total_seconds())
@@ -264,6 +261,7 @@ async def count_open(pool, user_id: int, kind: str) -> int:
         """, user_id, kind)
 
 async def inc_chat_metrics(pool, user_id: int, msg: Message):
+    # فقط گروه اصلی
     d = today_teh()
     is_reply = msg.reply_to_message is not None
     async with pool.acquire() as con:
@@ -292,9 +290,12 @@ async def inc_chat_metrics(pool, user_id: int, msg: Message):
         """, user_id, d)
 
 # ---------- آمار «فقط گروه اصلی» ----------
+def _main_src_like():
+    return f"%{src_tag(MAIN_CHAT_ID)}%"
+
 async def admin_today_stats_main(pool, user_id: int):
     d = today_teh()
-    pat = f"%{src_tag(MAIN_CHAT_ID)}%"
+    pat = _main_src_like()
     async with pool.acquire() as con:
         row = await con.fetchrow("""
         WITH cm AS (
@@ -320,7 +321,7 @@ async def admin_today_stats_main(pool, user_id: int):
 
 async def admins_overview_today_main(pool):
     d = today_teh()
-    pat = f"%{src_tag(MAIN_CHAT_ID)}%"
+    pat = _main_src_like()
     async with pool.acquire() as con:
         rows = await con.fetch("""
         WITH u AS (
@@ -356,7 +357,7 @@ async def admins_overview_today_main(pool):
 
 async def last_30_days_stats_main(pool, user_id: int):
     start_d = today_teh() - timedelta(days=30)
-    pat = f"%{src_tag(MAIN_CHAT_ID)}%"
+    pat = _main_src_like()
     async with pool.acquire() as con:
         row = await con.fetchrow("""
         WITH cm AS (
@@ -455,15 +456,16 @@ def owner_help_text() -> str:
         "• <code>آمار</code> — تعداد کاربران فعال امروز",
         "• <code>آمار کلی کاربر id</code> — ۳۰ روز اخیر",
         "",
-        "<b>تگ گروهی (ریپلای روی پیام)</b>",
-        "• <code>تگ چت</code> — منشن چتی‌ها",
-        "• <code>تگ کال</code> — منشن کولی‌ها",
-        "• <code>تگ همه</code> — هر دو (فقط مالک/ارشدکل)",
+        "<b>تگ گروهی (ریپلای روی پیام یا مستقل)</b>",
+        "• <code>تگ چت</code> / <code>تگ کال</code> / <code>تگ همه</code>",
         "",
         "<b>تشخیصی (متنی)</b>",
         "• <code>whereami</code> — هرجا (فقط مالک/ادمین‌ها)",
         "• <code>whoami</code> — پی‌وی",
         "• <code>health</code> — پی‌وی فقط مالک",
+        "",
+        "<b>ممنوع/آزاد</b>",
+        "• ریپلای کنید یا @username یا id بدهید: <code>ممنوع</code> / <code>آزاد</code>"
     ])
 
 # ----------------------------- Bot Init --------------------------------------
@@ -473,8 +475,43 @@ scheduler = AsyncIOScheduler(timezone=TEHRAN)
 pool: asyncpg.Pool = None
 tclient = None
 
+# ----------------------------- Helpers (Resolvers) ---------------------------
+async def resolve_user_identifier(msg: Message, ident: str | None) -> int | None:
+    """
+    سعی می‌کند هدف را از ۳ راه پیدا کند:
+    1) ریپلای به پیام → from_user.id
+    2) آیدی عددی
+    3) @username → اول Bot API (get_chat) سپس دیتابیس users
+    """
+    # 1) reply
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        return msg.reply_to_message.from_user.id
+
+    # 2) numeric id
+    if ident and ident.isdigit():
+        return int(ident)
+
+    # 3) username
+    if ident and ident.startswith("@"):
+        uname = ident[1:]
+        # try Bot API
+        try:
+            ch = await bot.get_chat(ident)
+            if getattr(ch, "id", None):
+                return ch.id
+        except Exception:
+            pass
+        # fallback: DB (case-insensitive)
+        async with pool.acquire() as con:
+            uid = await con.fetchval(
+                "SELECT user_id FROM users WHERE lower(username)=lower($1) LIMIT 1",
+                uname
+            )
+            if uid:
+                return int(uid)
+    return None
+
 # ----------------------------- Help Handlers ---------------------------------
-# فقط متنی
 @dp.message(F.text.regexp(r"^(?:راهنما|help)$"), F.chat.type == ChatType.PRIVATE)
 async def help_pv(msg: Message):
     role = await get_role(pool, msg.from_user.id)
@@ -627,6 +664,7 @@ async def job_daily_rollover_main_only():
                 f"• پیام‌ها(اصلی): <b>{r['msgs']}</b> | چت(اصلی): <b>{pretty_td(r['chat_secs'])}</b> | کال(اصلی): <b>{pretty_td(r['call_secs'])}</b>"
             )
         text = "\n".join(lines)
+        # ارسال به پی‌وی مالک و گارد
         await bot.send_message(OWNER_ID, text)
         await bot.send_message(GUARD_CHAT_ID, text)
     except Exception as e:
@@ -666,7 +704,7 @@ async def any_group_common(msg: Message):
     if msg.chat.id == MAIN_CHAT_ID:
         await inc_chat_metrics(pool, u.id, msg)
 
-# /start در پی‌وی (اجباری تلگرام برای آغاز PM) + معادل متنی در پایین
+# /start در پی‌وی
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def start_pv(msg: Message):
     await ensure_user(pool, msg.from_user)
@@ -722,7 +760,7 @@ async def main_group_prompt_first(msg: Message):
 async def unified_shortcuts(msg: Message):
     u = msg.from_user
     role = await get_role(pool, u.id)
-    text = (msg.text or "").strip().lower()
+    text = re.sub(r"\s+", " ", (msg.text or "").strip().lower())
     if text not in {"ثبت ورود", "ثبت خروج", "ثبت"}:
         return
     if not (role in (ALLOWED_CHAT_ROLES | ALLOWED_VOICE_ROLES) or u.id == OWNER_ID):
@@ -977,7 +1015,7 @@ async def request_admin_command(msg: Message):
 
 async def get_user_last_days_stats(pool, user_id: int, days: int = 7):
     start_d = today_teh() - timedelta(days=days)
-    pat = f"%{src_tag(MAIN_CHAT_ID)}%"
+    pat = _main_src_like()
     async with pool.acquire() as con:
         row = await con.fetchrow("""
         WITH cm AS (
@@ -1020,7 +1058,7 @@ async def request_admin_cb(cb: CallbackQuery):
     await cb.message.edit_text("✅ درخواست شما ارسال شد. نتیجه از طرف مدیریت اعلام می‌شود.")
     await cb.answer()
 
-# ------------------ تگ گروهی ------------------
+# ------------------ تگ گروهی (همه‌جا) ------------------
 async def fetch_role_user_ids(pool, roles):
     async with pool.acquire() as con:
         rows = await con.fetch("SELECT user_id, first_name FROM users WHERE role = ANY($1::text[])", list(roles))
@@ -1032,7 +1070,7 @@ def mentions_from_list(items, limit=50):
         out.append(f"<a href=\"tg://user?id={uid}\">{name}</a>")
     return " ".join(out)
 
-@dp.message((F.chat.id == MAIN_CHAT_ID) | (F.chat.id == GUARD_CHAT_ID), F.reply_to_message, F.text.regexp(r"^تگ\s*(چت|کال|همه)$"))
+@dp.message(F.text.regexp(r"^تگ\s*(چت|کال|همه)$"))
 async def tag_commands(msg: Message):
     who = msg.from_user
     role = await get_role(pool, who.id)
@@ -1063,7 +1101,10 @@ async def tag_commands(msg: Message):
     if not tag_ids:
         return await msg.reply("کسی برای تگ یافت نشد.")
     tags = mentions_from_list(tag_ids, limit=50)
-    await msg.reply_to_message.reply(f"🔔 {tags}")
+    if msg.reply_to_message:
+        await msg.reply_to_message.reply(f"🔔 {tags}")
+    else:
+        await msg.reply(f"🔔 {tags}")
 
 # ------------------ رأی مالک ------------------
 @dp.callback_query(F.data.regexp(r"^fb:(\d+):(-?1)$"))
@@ -1080,12 +1121,12 @@ async def feedback_cb(cb: CallbackQuery):
 
 # ----------------------- دستورهای متنی مالک (بدون /) -----------------------
 OWNER_CMD_PATTERNS = [
-    (r"^(ترفیع|عزل)\s+(چت|کال|ارشدچت|ارشدکال|ارشدکل)\s+(@\w+|\d+)$", "promote_demote"),
+    (r"^(ترفیع|عزل)\s+(چت|کال|ارشدچت|ارشدکال|ارشدکل)\s+(@\w+|\d+)?$", "promote_demote"),
     (r"^آمار\s*چت\s*الان$", "stats_chat_now"),
     (r"^آمار\s*کال\s*الان$", "stats_call_now"),
     (r"^آمار\s*$", "stats_active"),
-    (r"^ممنوع\s+(\d+)$", "ban_user"),
-    (r"^آزاد\s+(\d+)$", "unban_user"),
+    (r"^ممنوع(?:\s+(@\w+|\d+))?$", "ban_user"),
+    (r"^آزاد(?:\s+(@\w+|\d+))?$", "unban_user"),
     (r"^اتک\s*بک\s+(.+)$", "attack_back"),
     (r"^تایتل\s*کال\s+(.+)$", "call_title"),
     (r"^آمار\s*کلی\s*کاربر\s+(\d+)$", "user_month")
@@ -1101,57 +1142,93 @@ ROLE_MAP = {
 
 @dp.message(F.from_user.id == OWNER_ID)
 async def owner_text_commands(msg: Message):
-    text = (msg.text or "").strip()
+    text_raw = (msg.text or "").strip()
+    text = re.sub(r"\s+", " ", text_raw)
     if re.fullmatch(r"(?:راهنما|help)", text):
         return await msg.reply(owner_help_text())
 
     for pat, name in OWNER_CMD_PATTERNS:
         m = re.match(pat, text)
-        if not m: continue
+        if not m: 
+            continue
+
+        # -------- ترفیع/عزل با ریپلای/ID/@username --------
         if name == "promote_demote":
             act, kind, ident = m.groups()
-            if ident.startswith("@"):
-                try:
-                    u = await bot.get_chat(ident)
-                    target_id = u.id
-                except Exception:
-                    return await msg.reply("یوزرنیم یافت نشد.")
-            else:
-                target_id = int(ident)
+            target_id = await resolve_user_identifier(msg, ident)
+            if not target_id:
+                return await msg.reply("❗ لطفاً روی پیام فرد ریپلای کنید یا آیدی عددی/یوزرنیم معتبر بدهید.")
             role_key = ROLE_MAP[kind]
             if act == "ترفیع":
-                await set_role(pool, target_id, role_key)
+                ok = await set_role(pool, target_id, role_key)
+                if not ok:
+                    await msg.reply("نقش نامعتبر.")
+                    return
                 await msg.reply(f"✅ {target_id} به {role_title(role_key)} ترفیع یافت.")
             else:
                 await set_role(pool, target_id, "member")
                 await msg.reply(f"✅ {target_id} عزل شد.")
             return
+
+        # -------- آمار لحظه‌ای (ارسال به PV مالک و گارد) --------
         elif name == "stats_chat_now":
             rows = await admins_overview_today_main(pool)
             lines = ["📊 آمار چت تا این لحظه — فقط اصلی:"]
             for r in sorted(rows, key=lambda r: ROLE_ORDER.get(r["role"], 99)):
                 lines.append(f"{role_title(r['role'])} — <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a>: چت {pretty_td(r['chat_secs'])} | پیام {r['msgs']}")
-            await msg.reply("\n".join(lines)); return
+            text_stats = "\n".join(lines)
+            await bot.send_message(OWNER_ID, text_stats)
+            await bot.send_message(GUARD_CHAT_ID, text_stats)
+            await msg.reply("✅ آمار به پی‌وی مالک و گارد ارسال شد.")
+            return
+
         elif name == "stats_call_now":
             rows = await admins_overview_today_main(pool)
             lines = ["🎙️ آمار کال تا این لحظه — فقط اصلی:"]
             for r in sorted(rows, key=lambda r: ROLE_ORDER.get(r["role"], 99)):
                 lines.append(f"{role_title(r['role'])} — <a href=\"tg://user?id={r['user_id']}\">{r['first_name'] or r['user_id']}</a>: کال {pretty_td(r['call_secs'])}")
-            await msg.reply("\n".join(lines)); return
+            text_stats = "\n".join(lines)
+            await bot.send_message(OWNER_ID, text_stats)
+            await bot.send_message(GUARD_CHAT_ID, text_stats)
+            await msg.reply("✅ آمار به پی‌وی مالک و گارد ارسال شد.")
+            return
+
         elif name == "stats_active":
             async with pool.acquire() as con:
                 n = await con.fetchval("SELECT COUNT(DISTINCT user_id) FROM chat_metrics WHERE d=$1", today_teh())
-            await msg.reply(f"👥 کاربران فعال امروز (اصلی): <b>{n}</b>"); return
+            text_stats = f"👥 کاربران فعال امروز (اصلی): <b>{n}</b>"
+            await bot.send_message(OWNER_ID, text_stats)
+            await bot.send_message(GUARD_CHAT_ID, text_stats)
+            await msg.reply("✅ آمار به پی‌وی مالک و گارد ارسال شد.")
+            return
+
+        # -------- ممنوع / آزاد با ریپلای/ID/@username --------
         elif name == "ban_user":
-            uid = int(m.group(1))
+            ident = m.group(1)
+            uid = await resolve_user_identifier(msg, ident)
+            if not uid:
+                return await msg.reply("❗ برای ممنوع‌کردن، ریپلای کنید یا آیدی/یوزرنیم معتبر بدهید.")
             async with pool.acquire() as con:
                 await con.execute("INSERT INTO bans(user_id) VALUES($1) ON CONFLICT (user_id) DO NOTHING", uid)
-            await msg.reply(f"⛔ کاربر {uid} در لیست ممنوع قرار گرفت."); return
+            txt = f"⛔ کاربر {uid} در لیست ممنوع قرار گرفت."
+            await msg.reply(txt)
+            await bot.send_message(OWNER_ID, txt)
+            await bot.send_message(GUARD_CHAT_ID, txt)
+            return
+
         elif name == "unban_user":
-            uid = int(m.group(1))
+            ident = m.group(1)
+            uid = await resolve_user_identifier(msg, ident)
+            if not uid:
+                return await msg.reply("❗ برای آزادکردن، ریپلای کنید یا آیدی/یوزرنیم معتبر بدهید.")
             async with pool.acquire() as con:
                 await con.execute("DELETE FROM bans WHERE user_id=$1", uid)
-            await msg.reply(f"✅ کاربر {uid} آزاد شد."); return
+            txt = f"✅ کاربر {uid} آزاد شد."
+            await msg.reply(txt)
+            await bot.send_message(OWNER_ID, txt)
+            await bot.send_message(GUARD_CHAT_ID, txt)
+            return
+
         elif name == "attack_back":
             link = m.group(1).strip()
             if not ENABLE_TELETHON or not tclient:
@@ -1177,11 +1254,14 @@ async def owner_text_commands(msg: Message):
                     lines.append("\n• اعضای مشترک:")
                     for uid2 in list(commons)[:100]:
                         lines.append(f" - <a href=\"tg://user?id={uid2}\">{uid2}</a>")
-                await bot.send_message(GUARD_CHAT_ID, "\n".join(lines))
+                report_txt = "\n".join(lines)
+                await bot.send_message(GUARD_CHAT_ID, report_txt)
+                await bot.send_message(OWNER_ID, report_txt)
                 await msg.reply("گزارش اتک ارسال شد.")
             except Exception as e:
                 await msg.reply(f"خطا در اتک‌بک: {e}")
             return
+
         elif name == "call_title":
             title = m.group(1).strip()
             if not ENABLE_TELETHON or not tclient:
@@ -1191,6 +1271,7 @@ async def owner_text_commands(msg: Message):
             except Exception as e:
                 await msg.reply(f"خطا: {e}")
             return
+
         elif name == "user_month":
             uid_req = int(m.group(1))
             st = await last_30_days_stats_main(pool, uid_req)
@@ -1201,7 +1282,9 @@ async def owner_text_commands(msg: Message):
                    f"پیام‌ها: {st['msgs']} | ریپلای‌ها: {st['rs']}/{st['rr']}\n"
                    f"چت: {pretty_td(st['chat_secs'])} | کال: {pretty_td(st['call_secs'])}\n"
                    f"تاریخ الحاق به گارد: {jg if jg else 'نامشخص'}")
-            await msg.reply(txt, reply_markup=kb_feedback(uid_req))
+            await bot.send_message(OWNER_ID, txt)
+            await bot.send_message(GUARD_CHAT_ID, txt)
+            await msg.reply("✅ آمار به پی‌وی مالک و گارد ارسال شد.")
             return
 
 # ------------------------------ RUN -----------------------------------------
