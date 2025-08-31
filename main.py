@@ -1095,16 +1095,13 @@ def build_app() -> Application:
 
     # Contact flows
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE) & filters.ChatType.PRIVATE, pipe_user_message))
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE) & filters.Chat(GUARD_CHAT_ID), capture_admin_reply))
+    app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) & filters.ALL, capture_admin_reply))
 
     # Text triggers (no slash)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_triggers))
 
     # Group capture (main chat)
-    app.add_handler(MessageHandler(
-    filters.Chat(MAIN_CHAT_ID) & filters.UpdateType.MESSAGE,
-    group_message
-))
+    app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & filters.ALL, group_message))
     return app
 
 if __name__ == "__main__":
