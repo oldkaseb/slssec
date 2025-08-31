@@ -622,7 +622,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
             return
-        if "حذف سکوت" in txt یا "حذف خفه" in txt:
+        if "حذف سکوت" in txt or "حذف خفه" in txt:
             target = extract_target_from_text_or_reply(update)
             if not target: await update.message.reply_text("ریپلای لازم است."); return
             perms = ChatPermissions(
