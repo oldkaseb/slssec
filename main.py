@@ -487,19 +487,24 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, sess_id: int, reason="
               {col}=daily_stats.{col}+$3, last_checkout=$4 {inc_call}""",
         today(), sess["user_id"], dur, end_ts
     )
-    # clean inline msg if exists
+    # پاک کردن پیام دکمه‌دار گارد
     if sess["open_msg_chat"] and sess["open_msg_id"]:
         try:
             await context.bot.delete_message(sess["open_msg_chat"], sess["open_msg_id"])
         except Exception:
             pass
-    # notify guard + owner
+    # اعلان‌ها
     txt = f"{'⛔️' if reason!='manual' else '❌'} خروج {('چت' if sess['kind']=='chat' else 'کال')} — مدت: {human_td(dur)}"
     for ch in [GUARD_CHAT_ID, OWNER_ID]:
         try:
             await context.bot.send_message(ch, txt)
         except Exception:
             pass
+    # همچنین برای خودِ ادمین
+    try:
+        await context.bot.send_message(sess["user_id"], txt)
+    except Exception:
+        pass
 
 async def schedule_inactivity(context: ContextTypes.DEFAULT_TYPE, sess_id: int):
     name = f"inact_{sess_id}"
@@ -588,7 +593,7 @@ async def on_guard_reply_block(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("reply_"):
         tid = int(data.split("_", 1)[1])
 
-        # ✅ حالت One-Shot: فقط برای همین ادمین ذخیره می‌کنیم
+        # One-Shot: مجوز پاسخ فقط برای همین ادمین (و فقط یک پیام بعدی)
         context.user_data["one_shot_reply_tid"] = tid
 
         await q.message.reply_text(
@@ -599,44 +604,38 @@ async def on_guard_reply_block(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
 async def capture_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # فقط اگر این ادمین دکمهٔ «پاسخ» را زده باشد
+    # فقط اگر این ادمین دکمه «پاسخ» را زده باشد
     tid = context.user_data.pop("one_shot_reply_tid", None)
     if not tid:
-        # هیچ وظیفهٔ پاسخ فعالی برای این ادمین نیست → هیچ کاری نکن
-        return
+        return  # مجوز پاسخ فعال نیست
 
-    # چک می‌کنیم ترد معتبر است
     rec = await db.fetchrow("SELECT * FROM contact_threads WHERE id=$1", tid)
     if not rec:
         await update.message.reply_text("ترد نامعتبر است. دوباره دکمه «پاسخ» را بزنید.")
         return
 
-    uid = rec["user_id"]
+    uid = rec["user_id"]  # مخاطب (کاربر)
+    m = update.message
 
-    # فقط یک بار همین پیام را می‌فرستیم (One-Shot)
     try:
-        if update.message.text:
-            await context.bot.send_message(uid, f"پاسخ مدیریت:\n\n{update.message.text}")
-        elif update.message.photo:
-            await context.bot.send_photo(uid, update.message.photo[-1].file_id, caption="پاسخ مدیریت:")
-        elif update.message.voice:
-            await context.bot.send_voice(uid, update.message.voice.file_id, caption="پاسخ مدیریت:")
-        elif update.message.document:
-            await context.bot.send_document(uid, update.message.document.file_id, caption="پاسخ مدیریت:")
-        elif update.message.video:
-            await context.bot.send_video(uid, update.message.video.file_id, caption="پاسخ مدیریت:")
-        elif update.message.animation:
-            await context.bot.send_animation(uid, update.message.animation.file_id, caption="پاسخ مدیریت:")
+        if m.text:
+            await context.bot.send_message(uid, f"پاسخ مدیریت:\n\n{m.text}")
+        elif m.photo:
+            await context.bot.send_photo(uid, m.photo[-1].file_id, caption="پاسخ مدیریت:")
+        elif m.voice:
+            await context.bot.send_voice(uid, m.voice.file_id, caption="پاسخ مدیریت:")
+        elif m.document:
+            await context.bot.send_document(uid, m.document.file_id, caption="پاسخ مدیریت:")
+        elif m.video:
+            await context.bot.send_video(uid, m.video.file_id, caption="پاسخ مدیریت:")
+        elif m.animation:
+            await context.bot.send_animation(uid, m.animation.file_id, caption="پاسخ مدیریت:")
         else:
             await context.bot.send_message(uid, "پاسخ مدیریت ارسال شد.")
 
-        # تأیید به ادمینِ پاسخ‌دهنده
-        await update.message.reply_text(
-            "پاسخ ارسال شد ✅\n"
-            "برای ارسال پاسخ جدید، دوباره دکمه «پاسخ» را بزنید."
-        )
+        await m.reply_text("پاسخ ارسال شد ✅\nبرای پاسخ جدید، دوباره دکمه «پاسخ» را بزنید.")
     except Exception:
-        await update.message.reply_text("ارسال پاسخ ناموفق بود. دوباره تلاش کنید.")
+        await m.reply_text("ارسال پاسخ ناموفق بود. دوباره تلاش کنید.")
 
 async def on_owner_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -949,30 +948,57 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Group message capture --------------------
 async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # فقط گروه اصلی
     if update.effective_chat.id != MAIN_CHAT_ID:
         return
-    msg = update.message; u = msg.from_user
+
+    msg = update.message
+    u = msg.from_user
+
+    # همه کاربران را در جدول users/اعضا ثبت/به‌روز کن
     await ensure_user(u)
+
+    # آمار کاربران عادی برای «کاندید ادمینی»
     await bump_member_stats(u.id)
 
+    # اگر ادمین/ارشد/مالک است → آمار ادمین و ورود خودکار
     is_admin = await db.fetchrow(
-        "SELECT 1 FROM users WHERE user_id=$1 AND (role IS NOT NULL OR $1=$2)", u.id, OWNER_ID
+        "SELECT 1 FROM users WHERE user_id=$1 AND (role IS NOT NULL OR $1=$2)",
+        u.id, OWNER_ID
     )
-    if is_admin:
-        await bump_admin_on_message(msg)
-        conf = await db.fetchrow("SELECT auto_mode FROM config WHERE id=TRUE")
-        if conf and conf["auto_mode"]:
-            sess = await get_open_session(u.id, "chat")
-            if not sess:
-                m = await context.bot.send_message(
-                    GUARD_CHAT_ID,
-                    f"✔️ ورود خودکار (چت): {mention_html(u)}",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb_checkout("chat")
-                )
-                await start_session(context, u.id, "chat", msg_chat=m.chat_id, msg_id=m.message_id)
-            else:
-                await db.execute("UPDATE sessions SET last_activity_ts=$1 WHERE id=$2", now(), sess["id"])
+    if not is_admin:
+        return
+
+    # ثبت پیام/ریپلای در daily_stats (فقط گروه اصلی)
+    await bump_admin_on_message(msg)
+
+    # اگر سشن چت باز است، فقط last_activity را آپدیت کن
+    open_chat = await get_open_session(u.id, "chat")
+    if open_chat:
+        await db.execute("UPDATE sessions SET last_activity_ts=$1 WHERE id=$2", now(), open_chat["id"])
+
+    # ورود خودکار چت در حالت «ح غ روشن»
+    conf = await db.fetchrow("SELECT auto_mode FROM config WHERE id=TRUE")
+    if conf and conf["auto_mode"] and not open_chat:
+        # پیام حضور به گارد با دکمه خروج
+        guard_msg = await context.bot.send_message(
+            GUARD_CHAT_ID,
+            f"✔️ ورود خودکار (چت): {mention_html(u)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_checkout("chat")
+        )
+        # سشن را باز کن (برای تایمر ۱۰ دقیقه بی‌فعالی)
+        await start_session(context, u.id, "chat", msg_chat=guard_msg.chat_id, msg_id=guard_msg.message_id)
+
+        # اطلاع به مالک و خودِ ادمین
+        try:
+            await context.bot.send_message(OWNER_ID, f"✅ ورود چت خودکار: {mention_html(u)}", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(u.id, "ورود خودکار چت برای شما ثبت شد ✅", reply_markup=kb_checkout("chat"))
+        except Exception:
+            pass
 
 # -------------------- Daily jobs --------------------
 async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
@@ -1083,25 +1109,29 @@ def build_app() -> Application:
         .post_shutdown(post_shutdown) \
         .build()
 
-    # /start (CommandHandler — PTB v20)
-    app.add_handler(CommandHandler("start", start))
+    # /start (CommandHandler — PTB v20)    # /start
+    app.add_handler(CommandHandler("start", start), group=0)
 
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(on_contact_btn, pattern="^(contact_guard|contact_owner|back_home|retry_send)$"))
-    app.add_handler(CallbackQueryHandler(on_owner_rate, pattern="^(rate_yes|rate_no)$"))
-    app.add_handler(CallbackQueryHandler(on_checkin_checkout, pattern="^(checkin_chat|checkin_call|checkout_(chat|call)|switch_to_(chat|call))$"))
-    app.add_handler(CallbackQueryHandler(on_my_stats, pattern="^my_stats$"))
-    app.add_handler(CallbackQueryHandler(on_guard_reply_block, pattern="^(reply_|block_)\\d+$"))
+    # --- Callbacks (اول اجرا شوند)
+    app.add_handler(CallbackQueryHandler(on_contact_btn, pattern="^(contact_guard|contact_owner|back_home|retry_send)$"), group=0)
+    app.add_handler(CallbackQueryHandler(on_owner_rate, pattern="^(rate_yes|rate_no)$"), group=0)
+    app.add_handler(CallbackQueryHandler(on_checkin_checkout, pattern="^(checkin_chat|checkin_call|checkout_(chat|call)|switch_to_(chat|call))$"), group=0)
+    app.add_handler(CallbackQueryHandler(on_my_stats, pattern="^my_stats$"), group=0)
+    app.add_handler(CallbackQueryHandler(on_guard_reply_block, pattern="^(reply_|block_)\\d+$"), group=0)
 
-    # Contact flows
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE) & filters.ChatType.PRIVATE, pipe_user_message))
-    app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) & filters.ALL, capture_admin_reply))
+    # --- پیام‌های گارد برای پاسخ ادمین‌ها (One-Shot)
+    # هر نوع پیام در گارد → فقط برای ادمینی که دکمه «پاسخ» زده یک‌بار فوروارد می‌شود
+    app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) & ~filters.StatusUpdate.ALL, capture_admin_reply), group=1)
 
-    # Text triggers (no slash)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_triggers))
+    # --- پیام‌های گروه اصلی (آمار/ورود خودکار) — فقط از MAIN_CHAT_ID
+    app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & ~filters.StatusUpdate.ALL, group_message), group=2)
 
-    # Group capture (main chat)
-    app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & filters.ALL, group_message))
+    # --- فلو تماس در پیوی (کاربر → گارد/مالک)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.StatusUpdate.ALL, pipe_user_message), group=3)
+
+    # --- دستورات متنی بدون / (در همه‌جا)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_triggers), group=4)
+    
     return app
 
 if __name__ == "__main__":
