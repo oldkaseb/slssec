@@ -15,8 +15,9 @@ from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler,
+    AIORateLimiter, Application, CommandHandler   # 👈 این را اضافه کن
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -788,7 +789,7 @@ def build_app() -> Application:
         .build()
 
     # /start
-    app.add_handler(MessageHandler(filters.CommandStart(), start))
+    app.add_handler(CommandHandler("start", start))
 
     # callbacks
     app.add_handler(CallbackQueryHandler(on_contact_btn, pattern="^(contact_guard|contact_owner|back_home|retry_send)$"))
