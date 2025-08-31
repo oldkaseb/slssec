@@ -1,6 +1,7 @@
 # main.py — Souls Security Bot (Railway + PostgreSQL)
 # PTB v20.x (async)
 # ENV: BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ=Asia/Tehran
+# Optional: FUN_LINES_FILE=/app/fun_lines.txt   (یک جمله در هر خط)
 
 import os
 import re
@@ -165,8 +166,9 @@ CREATE TABLE IF NOT EXISTS admin_requests (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS msg_count INT NOT NULL DEFAULT 0;
 """
 
-# -------------------- Fun lines for random tag --------------------
-FUN_LINES = [
+# -------------------- Fun lines (loaded from file if provided) --------------------
+DEFAULT_FUN_LINES = [
+    # لیست تمیز و بی‌خطر (در صورت نیاز می‌تونی فایل بیرونی بدهی)
     "یادت نره آب بخوری! 💧",
     "امروزت پر از انرژی مثبت باشه ✨",
     "یه لبخند کوچیک می‌تونه روزتو عوض کنه 🙂",
@@ -177,99 +179,57 @@ FUN_LINES = [
     "بهت افتخار می‌کنیم 👏",
     "یه آهنگ خوب گوش بده 🎶",
     "یه لیوان چای داغ می‌چسبه 🍵",
-    "کسی که زیاد می‌خنده همیشه برنده‌ست 😂",
     "ذهن آروم = زندگی قشنگ 🧘",
     "هیچ چیز به اندازه سلامتی مهم نیست 💪",
-    "یه کار خوب کوچیک انجام بده ❤️",
     "یادت نره خوشحال باشی 😍",
-    "دنیارو با انرژی خوبت قشنگ‌تر کن 🌍",
-    "باور کن از پس همه‌چی برمیای 💯",
     "هر روز یه شروع جدیده 🌅",
     "یه قهوه خوب همه‌چی رو درست می‌کنه ☕️",
     "امید هیچ‌وقت فراموش نشه 🌈",
-    "همیشه به جلو نگاه کن 🚀",
     "با یه لبخند دنیا رو تغییر بده 😁",
     "مهربون بودن همیشه قشنگه 💕",
-    "یادت نره ورزش سبک انجام بدی 🏃",
     "هر چیزی درست میشه، فقط صبور باش ⏳",
-    "تو خاصی! 💎",
     "شاد بودن انتخابه، انتخاب کن 😎",
     "زندگی کوتاهه، ساده بگیر 🌼",
     "تو می‌تونی، فقط ادامه بده 🔥",
-    "امروز می‌تونه شروع یه چیز بزرگ باشه 🚀",
     "شاد بودن مسریه، پخش کن 😁",
-    "یه فنجون قهوه همیشه جواب میده ☕️",
     "دنیا جای قشنگ‌تری میشه با تو 🌍",
     "لبخند بزن، حتی وقتی سخت میشه 🌻",
     "قدردان چیزای کوچیک باش 🙏",
     "با انرژی مثبت جلو برو 🔆",
-    "تو قهرمانی، حتی تو چیزای کوچیک 🥊",
     "یه لحظه بشین و لذت ببر 🌅",
-    "خاطره‌سازی بهترین کاره 📷",
     "نفس عمیق = آرامش واقعی 🌬️",
-    "آرامش رو نفس بکش 😌",
     "یکم به خودت جایزه بده 🎁",
     "یک کتاب خوب شروع کن 📖",
     "هیچ وقت دیر نیست شروع کنی ⏰",
     "ساده زندگی کن 🌱",
-    "گاهی فقط باید بخوابی 😴",
     "به لحظه‌ها اهمیت بده ⏳",
     "باور داشته باش بهترین‌ها در راهن 🌈",
-    "خودت باش، بقیه همه تکراری‌ان 🤗",
-    "تو خیلی مهمی 💯",
-    "یاد بگیر از اشتباهات 💡",
-    "به آینده امیدوار باش 🔮",
     "موفقیت با تلاش میاد 🛠️",
-    "آرام جلو برو 🌊",
-    "گاهی یه چرت کوتاه لازمه 😌",
     "یه موزیک شاد پلی کن 🎧",
-    "همین الان یه پیام خوب به یه دوست بده 📩",
     "خستگی یعنی تو تلاش کردی 👏",
-    "به دل خودت گوش کن 💓",
     "شاد بودن رو به بقیه هم هدیه بده 🎁",
-    "هر روز یه فرصت جدیده 🪂",
     "یادته چقدر قوی‌ای؟ 💪",
     "باور کن همه‌چی درست میشه 🌞",
     "خاطره‌های خوب بساز 📸",
-    "امیدتو از دست نده 💫",
-    "هر روز پر از لبخند 🌸",
-    "دنیا رو قشنگ‌تر ببین 🌈",
-    "ثابت‌قدم باش 💪",
-    "مهربانی یادت نره ❤️",
-    "یه لیوان آب خنک خیلی می‌چسبه 🥤",
-    "بهترین لحظه همینه ⏰",
-    "بعضی وقتا فقط باید ریلکس کرد 🌴",
-    "یاد بگیر عاشق خودت باشی 💖",
-    "دنیارو با لبخندت روشن کن 🌟",
-    "دلت شاد، روزت قشنگ 🌺",
-    "هوای خودتو داشته باش 🌤️",
-    "رویاهاتو دنبال کن 🌠",
-    "از چیزای ساده لذت ببر 🍀",
-    "یه قدم کوچیک، یه تغییر بزرگ 👣",
-    "با آرامش ادامه بده 🧘",
-    "موفقیت نزدیکه ⛳️",
-    "امروز، روز توئه ⭐️",
-    "لبخندتو حفظ کن 🙂",
-    "حس خوب پخش کن ✨",
-    "یه لیوان چای؟ 🍵",
-    "یه موسیقی آروم گوش بده 🎼",
-    "گوشی رو بذار کنار، نفس بکش 🍃",
-    "به خودت استراحت بده ⏸️",
-    "امروز رو قشنگ بساز 🧩",
-    "یه کار جدید امتحان کن 🧪",
-    "خودت رو با کسی مقایسه نکن 🚫",
-    "قدم به قدم جلو برو 👟",
-    "امید یعنی زندگی 🌞",
-    "همه چی درست میشه 💫",
-    "آرزو کن و حرکت کن 🌠",
-    "خودتو دوست داشته باش 💖",
-    "بیا بخندیم 😄",
-    "یه چرت کوچولو بزن 😴",
+    "آرام جلو برو 🌊",
     "یکم آب بخور 💧",
-    "یه حرکت قشنگ بزن 👏",
     "به خودت افتخار کن 🥇",
     "روز خوبی بساز 🌼",
 ]
+
+def load_fun_lines() -> list[str]:
+    path = os.environ.get("FUN_LINES_FILE")
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            # محدودیت پایه برای جلوگیری از پیام خیلی بلند
+            return lines[:200]
+        except Exception:
+            pass
+    return DEFAULT_FUN_LINES
+
+FUN_LINES = load_fun_lines()
 
 # -------------------- DB --------------------
 class DB:
@@ -471,7 +431,7 @@ async def inactivity_job(context: ContextTypes.DEFAULT_TYPE):
         await end_session(context, sid, reason="بدون فعالیت ۵ دقیقه")
         context.job.schedule_removal()
 
-# -------------------- Role helpers --------------------
+# -------------------- Role helpers + Name mention --------------------
 async def get_role(uid: int) -> str | None:
     row = await db.fetchrow("SELECT role FROM users WHERE user_id=$1", uid)
     return row["role"] if row else None
@@ -481,6 +441,29 @@ async def is_senior_or_owner(uid: int) -> bool:
         return True
     role = await get_role(uid)
     return role in ("senior_all", "senior_chat", "senior_call")
+
+async def resolve_display_name(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
+    row = await db.fetchrow("SELECT first_name, last_name, username FROM users WHERE user_id=$1", uid)
+    if row:
+        fn = row["first_name"] or ""
+        ln = row["last_name"] or ""
+        name = (fn + (" " + ln if ln else "")).strip()
+        if name:
+            return name
+        if row["username"]:
+            return "@" + row["username"]
+    try:
+        cm = await context.bot.get_chat_member(MAIN_CHAT_ID, uid)
+        fn = cm.user.first_name or ""
+        ln = cm.user.last_name or ""
+        name = (fn + (" " + ln if ln else "")).strip() or (cm.user.username and "@" + cm.user.username)
+        return name or str(uid)
+    except Exception:
+        return str(uid)
+
+async def mention_name(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
+    name = await resolve_display_name(context, uid)
+    return f'<a href="tg://user?id={uid}">{name}</a>'
 
 # -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -617,20 +600,28 @@ async def on_checkin_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE
     await try_clear_kb(q.message)
 
     if q.data == "checkin_chat":
-        txt = f"✅ ورود چت: {mention_html(u)}"
+        txt = f"✅ ورود چت: {await mention_name(context, u.id)}"
         for dest in (GUARD_CHAT_ID, OWNER_ID):
             try: await context.bot.send_message(dest, txt, parse_mode=ParseMode.HTML)
             except Exception: pass
         await start_session(context, u.id, "chat")
+        try:
+            await q.message.edit_text("✅ فعالیت چت ثبت شد.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
         try: await context.bot.send_message(u.id, "ورود چت ثبت شد ✅")
         except Exception: pass
 
     elif q.data == "checkin_call":
-        txt = f"🎧 ورود کال: {mention_html(u)}"
+        txt = f"🎧 ورود کال: {await mention_name(context, u.id)}"
         for dest in (GUARD_CHAT_ID, OWNER_ID):
             try: await context.bot.send_message(dest, txt, parse_mode=ParseMode.HTML)
             except Exception: pass
         await start_session(context, u.id, "call")
+        try:
+            await q.message.edit_text("🎧 فعالیت کال ثبت شد.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
         try: await context.bot.send_message(u.id, "ورود کال ثبت شد ✅")
         except Exception: pass
 
@@ -643,11 +634,14 @@ async def on_checkin_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE
         other = "call" if target=="chat" else "chat"
         old = await get_open_session(u.id, other)
         if old: await end_session(context, old["id"], reason="تغییر فعالیت")
-        txt = f"🔁 تغییر فعالیت به {('چت' if target=='chat' else 'کال')}: {mention_html(u)}"
+        txt = f"🔁 تغییر فعالیت به {('چت' if target=='chat' else 'کال')}: {await mention_name(context, u.id)}"
         for dest in (GUARD_CHAT_ID, OWNER_ID):
             try: await context.bot.send_message(dest, txt, parse_mode=ParseMode.HTML)
             except Exception: pass
         await start_session(context, u.id, target)
+        try: await q.message.edit_text(f"🔁 تغییر فعالیت به {'چت' if target=='chat' else 'کال'} ثبت شد.", parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
         try: await context.bot.send_message(u.id, "تغییر فعالیت ثبت شد ✅")
         except Exception: pass
 
@@ -688,7 +682,7 @@ async def capture_owner_app_reply(update: Update, context: ContextTypes.DEFAULT_
     app_id, uid = info
     try:
         body = update.message.text_html if update.message.text else "(بدون متن)"
-        txt = f"📣 <b>پاسخ مالک</b> به درخواست ادمینی {mention_html(uid)}:\n\n{body}"
+        txt = f"📣 <b>پاسخ مالک</b> به درخواست ادمینی {await mention_name(context, uid)}:\n\n{body}"
         await context.bot.send_message(MAIN_CHAT_ID, txt, parse_mode=ParseMode.HTML)
         await db.execute("UPDATE admin_requests SET status='answered' WHERE id=$1", app_id)
         await update.message.reply_text("پاسخ منتشر شد ✅")
@@ -711,23 +705,26 @@ def extract_target_from_text_or_reply(update: Update):
 
 OWNER_HELP = (
     "راهنمای مالک (بدون /):\n"
-    "• ح غ روشن / ح غ خاموش — پاپ‌آپ ورود با اولین پیام؛ خروج چت: ۵ دقیقه سکون؛ کال: فقط دستی\n"
-    "• تگ رندوم روشن / خاموش — هر ۱۵ دقیقه یک منشن فان\n"
-    "• پینگ — سرعت پاسخ ربات\n"
-    "• ترفیع/عزل چت، کال، ارشدچت، ارشدکال، ارشدکل، کانال — ریپلای یا آیدی\n"
-    "• آمار چت الان / آمار کال الان — تا این لحظه\n"
-    '• "آمار" — تعداد کاربران فعال امروز گروه اصلی\n'
-    "• آمار کلی کاربر <آیدی> — ۳۰ روز گذشته کاربر\n"
-    "• ممنوع <آیدی> / آزاد <آیدی>\n"
-    "• زیرنظر+<آیدی> — گزارش شبانهٔ ویژه\n"
-    "• محدود رسانه / آزاد رسانه — محدودیت فقط-متن (ریپلای/آیدی)\n"
-    "• درخواست ادمینی — گزارش ۷ روز کاربر به گارد و مالک + پاسخ مالک\n"
-    "• لیست گارد — نمایش سلسله‌مراتب مدیران\n"
+    "• ح غ روشن / ح غ خاموش — Auto Mode: با اولین پیام پاپ‌آپ ثبت فعالیت (چت/کال). خروج چت: ۵ دقیقه سکون؛ کال: فقط دستی.\n"
+    "• ثبت — نمایش پاپ‌آپ ثبت فعالیت.\n"
+    "• ورود چت / ورود کال — متنی؛ مالک/ارشد می‌توانند با ریپلای/آیدی برای دیگران هم بزنند.\n"
+    "• ثبت خروج — متنی؛ فوراً خروج می‌زند (برای خود یا با ریپلای/آیدی برای دیگران). گزارش خروج شامل مدت و تعداد پیام نوبت است.\n"
+    "• تغییر فعالیت — پاپ‌آپ تغییر بین چت/کال.\n"
+    "• ترفیع/عزل چت، کال، ارشدچت، ارشدکال، ارشدکل، کانال — با ریپلای/آیدی.\n"
+    "• محدود رسانه / آزاد رسانه — محدودیت فقط-متن یا رفع آن (با ریپلای/آیدی).\n"
+    "• سکوت / حذف سکوت — در گروه اصلی و با ریپلای.\n"
+    "• ثبت پسر / ثبت دختر — برای خود یا با ریپلای تعیین جنسیت کاربر.\n"
+    "• تگ لیست دختر / تگ لیست پسر / تگ لیست همه — با ریپلای روی یک پیام، فهرست ثبت‌شده‌ها تگ می‌شوند.\n"
+    "• گارد — وضعیت امروزِ شما (پیام، ریپلای‌ها، حضور چت/کال).\n"
+    "• آمار — تعداد کاربران فعال امروز گروه اصلی.\n"
+    "• آمار چت الان / آمار کال الان — تا این لحظه برای کل تیم مدیریت (به‌همراه دکمهٔ رضایت).\n"
+    "• آمار کلی کاربر <آیدی> — گزارش ۳۰ روز گذشتهٔ یک کاربر.\n"
+    "• ممنوع <آیدی> / آزاد <آیدی> — لیست ممنوع.\n"
+    "• زیرنظر+<آیدی> — گزارش شبانهٔ اختصاصی.\n"
+    "• تگ رندوم روشن / خاموش — هر ۱۵ دقیقه یک منشن فان تصادفی.\n"
+    "• درخواست ادمینی — کاربر می‌فرستد؛ گزارش ۷ روزه به گارد و مالک می‌رود؛ «✍️ پاسخ مالک» کلیک شود و اولین پیام مالک منتشر می‌شود.\n"
+    "• لیست گارد — نمایش سلسله‌مراتب مدیریت با منشنِ نام (مالک در صدر).\n"
 )
-
-def _find_target_for_admin_ops(update: Update) -> int | None:
-    t = extract_target_from_text_or_reply(update)
-    return t or update.effective_user.id
 
 async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -768,31 +765,53 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "UPDATE users SET role=$2, joined_guard_at=COALESCE(joined_guard_at, NOW()) WHERE user_id=$1",
                 target, role_map[txt]
             )
-            await context.bot.send_message(GUARD_CHAT_ID, f"🔧 {txt} برای {mention_html(target)}", parse_mode=ParseMode.HTML)
-            await context.bot.send_message(OWNER_ID, f"🔧 {txt} برای {mention_html(target)}", parse_mode=ParseMode.HTML)
+            await context.bot.send_message(GUARD_CHAT_ID, f"🔧 {txt} برای {await mention_name(context, target)}", parse_mode=ParseMode.HTML)
+            await context.bot.send_message(OWNER_ID, f"🔧 {txt} برای {await mention_name(context, target)}", parse_mode=ParseMode.HTML)
             await update.message.reply_text("انجام شد."); return
 
         if txt == "آمار چت الان":
             rows = await db.fetch("""
                 SELECT u.user_id,u.role, COALESCE(s.chat_messages,0) msgs, COALESCE(s.chat_seconds,0) chat_time
                 FROM users u LEFT JOIN daily_stats s ON s.d=$1 AND s.user_id=u.user_id
-                WHERE u.role IS NOT NULL ORDER BY u.role, u.rank DESC NULLS LAST
+                WHERE u.role IS NOT NULL
+                  AND u.role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
+                ORDER BY
+                  CASE u.role
+                    WHEN 'senior_all' THEN 0
+                    WHEN 'senior_chat' THEN 1
+                    WHEN 'senior_call' THEN 2
+                    WHEN 'channel_admin' THEN 3
+                    WHEN 'chat_admin' THEN 4
+                    WHEN 'call_admin' THEN 5
+                    ELSE 9
+                  END, u.rank DESC NULLS LAST
             """, today())
             lines = ["آمار چت تا این لحظه:"]
             for r in rows:
-                lines.append(f"{r['role']}: {r['user_id']} | پیام: {r['msgs']} | حضور: {human_td(r['chat_time'])}")
-            await update.message.reply_text("\n".join(lines), reply_markup=kb_owner_rate()); return
+                lines.append(f"{r['role']}: {await mention_name(context, r['user_id'])} | پیام: {r['msgs']} | حضور: {human_td(r['chat_time'])}")
+            await update.message.reply_html("\n".join(lines), reply_markup=kb_owner_rate()); return
 
         if txt == "آمار کال الان":
             rows = await db.fetch("""
                 SELECT u.user_id,u.role, COALESCE(s.call_seconds,0) call_time, COALESCE(s.call_sessions,0) calls
                 FROM users u LEFT JOIN daily_stats s ON s.d=$1 AND s.user_id=u.user_id
-                WHERE u.role IS NOT NULL ORDER BY u.role, u.rank DESC NULLS LAST
+                WHERE u.role IS NOT NULL
+                  AND u.role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
+                ORDER BY
+                  CASE u.role
+                    WHEN 'senior_all' THEN 0
+                    WHEN 'senior_chat' THEN 1
+                    WHEN 'senior_call' THEN 2
+                    WHEN 'channel_admin' THEN 3
+                    WHEN 'chat_admin' THEN 4
+                    WHEN 'call_admin' THEN 5
+                    ELSE 9
+                  END, u.rank DESC NULLS LAST
             """, today())
             lines = ["آمار کال تا این لحظه:"]
             for r in rows:
-                lines.append(f"{r['role']}: {r['user_id']} | زمان کال: {human_td(r['call_time'])} | دفعات: {r['calls']}")
-            await update.message.reply_text("\n".join(lines), reply_markup=kb_owner_rate()); return
+                lines.append(f"{r['role']}: {await mention_name(context, r['user_id'])} | زمان کال: {human_td(r['call_time'])} | دفعات: {r['calls']}")
+            await update.message.reply_html("\n".join(lines), reply_markup=kb_owner_rate()); return
 
         if txt == "آمار":
             row = await db.fetchrow("SELECT COUNT(DISTINCT user_id) c FROM members_stats WHERE d=$1 AND chat_count>0", today())
@@ -813,11 +832,11 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 FROM daily_stats WHERE d >= $1 AND user_id=$2
             """, since, uid)
             await update.message.reply_text(
-                f"آمار ۳۰ روز گذشته کاربر {uid}:\n"
+                f"آمار ۳۰ روز گذشته {await mention_name(context, uid)}:\n"
                 f"- پیام چت: {r['msgs']} (ریپلای زده/دریافت: {r['rs']}/{r['rr']})\n"
                 f"- زمان چت: {human_td(r['chat_s'])}\n"
                 f"- زمان کال: {human_td(r['call_s'])} | دفعات کال: {r['calls']}"
-            ); return
+            , parse_mode=ParseMode.HTML); return
 
         if txt.startswith("ممنوع") or txt.startswith("آزاد "):
             m = re.search(r"(\d{4,})", txt)
@@ -843,7 +862,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if txt == "لیست گارد":
             rows = await db.fetch("""
                 SELECT user_id, role, rank FROM users
-                WHERE role IS NOT NULL
+                WHERE role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
                 ORDER BY
                   CASE role
                     WHEN 'senior_all' THEN 0
@@ -855,17 +874,23 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ELSE 9 END,
                   rank DESC NULLS LAST
             """)
-            if not rows:
-                await update.message.reply_text("هنوز گاردی ثبت نشده.")
-            else:
-                lines = ["👥 لیست گارد:"]
-                for r in rows:
-                    lines.append(f"- {r['role']}: {mention_html(r['user_id'])}")
-                await update.message.reply_html("\n".join(lines))
+            lines = ["👥 تیم مدیریت:"]
+            lines.append(f"- مالک: {await mention_name(context, OWNER_ID)}")
+            role_map = {
+                "senior_all": "ارشد کل",
+                "senior_chat": "ارشد چت",
+                "senior_call": "ارشد کال",
+                "channel_admin": "ادمین کانال",
+                "chat_admin": "ادمین چت",
+                "call_admin": "ادمین کال",
+            }
+            for r in rows:
+                rr = role_map.get(r["role"], r["role"])
+                lines.append(f"- {rr}: {await mention_name(context, r['user_id'])}")
+            await update.message.reply_html("\n".join(lines))
             return
 
     # ==== مشترک (مالک/ارشد/ادمین) ====
-    # ثبت/تغییر/خروج
     if txt == "ثبت":
         await update.message.reply_text("نوع فعالیت را انتخاب کنید:", reply_markup=kb_checkin()); return
 
@@ -875,7 +900,6 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("تغییر به کال", callback_data="switch_to_call"),
         ]])); return
 
-    # خروج فوری متنی (برای خود یا توسط مالک/ارشد برای دیگری با ریپلای/آیدی)
     if txt == "ثبت خروج":
         target = extract_target_from_text_or_reply(update)
         actor_is_mgr = await is_senior_or_owner(user.id)
@@ -886,7 +910,6 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await end_session(context, sess["id"], reason=("درخواست مدیر" if uid != user.id else "درخواست متنی"))
         await update.message.reply_text("خروج ثبت شد ✅"); return
 
-    # ورود چت/کال متنی (مالک/ارشد می‌توانند برای دیگران بزنند)
     if txt in ("ورود چت","ورود کال"):
         kind = "chat" if txt == "ورود چت" else "call"
         actor_is_mgr = await is_senior_or_owner(user.id)
@@ -896,7 +919,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old = await get_open_session(uid, other)
         if old: await end_session(context, old["id"], reason="تغییر فعالیت (متنی)")
         await start_session(context, uid, kind)
-        txt2 = f"✅ ورود {('چت' if kind=='chat' else 'کال')}: {mention_html(uid)}"
+        txt2 = f"✅ ورود {('چت' if kind=='chat' else 'کال')}: {await mention_name(context, uid)}"
         for dest in (GUARD_CHAT_ID, OWNER_ID):
             try: await context.bot.send_message(dest, txt2, parse_mode=ParseMode.HTML)
             except Exception: pass
@@ -913,7 +936,6 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"حضور چت: {human_td(r['chat_seconds'])} | کال: {human_td(r['call_seconds'])} | دفعات کال: {r['call_sessions']}"
         ); return
 
-    # محدود/آزاد رسانه (با ریپلای یا آیدی) — فقط ادمین/ارشد/مالک
     if txt in ("محدود رسانه","آزاد رسانه"):
         is_mgr = await is_senior_or_owner(user.id) or is_owner(user.id)
         if not is_mgr:
@@ -946,7 +968,6 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
         return
 
-    # سکوت/حذف سکوت (در گروه اصلی)
     if chat_id == MAIN_CHAT_ID:
         if txt.startswith(("سکوت","خفه")):
             target = extract_target_from_text_or_reply(update)
@@ -981,37 +1002,31 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt in ("ثبت پسر","ثبت دختر"):
         target = extract_target_from_text_or_reply(update) or user.id
         await db.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
-        await db.execute("UPDATE users SET gender=$2 WHERE user_id=$1", target, "male" if txt.endswith("پسر") else "female")
-        await update.message.reply_text("ثبت شد."); return
+        await db.execute(
+            "UPDATE users SET gender=$2 WHERE user_id=$1",
+            target, "male" if txt.endswith("پسر") else "female"
+        )
+        who = "برای خودتان" if target == user.id else f"برای {await mention_name(context, target)}"
+        await update.message.reply_html(f"✅ جنسیت {who} ثبت شد.")
+        return
 
-    # تگ‌ها: فقط با ریپلای روی همان پیام
-    if txt in ("تگ پسرها","تگ دخترها","تگ همه"):
+    # تگ‌های مبتنی بر جنسیت — فقط با ریپلای روی همان پیام
+    if txt in ("تگ لیست دختر","تگ لیست پسر","تگ لیست همه"):
         if not update.message.reply_to_message:
             await update.message.reply_text("باید روی یک پیام ریپلای کنید."); return
-        gender = None
-        if txt == "تگ پسرها":
-            gender = "male"
-        elif txt == "تگ دخترها":
-            gender = "female"
-        if gender:
-            rows = await db.fetch("""
-                SELECT DISTINCT u.user_id
-                FROM users u
-                JOIN members_stats m ON m.user_id = u.user_id AND m.d=$1 AND m.chat_count>0
-                WHERE u.gender=$2
-                LIMIT 30
-            """, today(), gender)
-        else:
-            rows = await db.fetch("""
-                SELECT DISTINCT m.user_id
-                FROM members_stats m
-                WHERE m.d=$1 AND m.chat_count>0
-                LIMIT 30
-            """, today())
+        where = ""
+        if txt == "تگ لیست دختر":
+            where = "WHERE gender='female'"
+        elif txt == "تگ لیست پسر":
+            where = "WHERE gender='male'"
+        rows = await db.fetch(f"SELECT user_id FROM users {where} ORDER BY rank DESC NULLS LAST LIMIT 40")
         if not rows:
-            await update.message.reply_text("کسی برای تگ یافت نشد."); return
-        mentions = " ".join([f'<a href="tg://user?id={r["user_id"]}">‎</a>' for r in rows])
-        await update.message.reply_to_message.reply_html(mentions)
+            await update.message.reply_text("فهرست خالی است."); return
+        parts = []
+        for r in rows:
+            parts.append(await mention_name(context, r["user_id"]))
+        text = " ".join(parts)
+        await update.message.reply_to_message.reply_html(text)
         return
 
     # درخواست ادمینی — هر کسی بزند
@@ -1023,7 +1038,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         la = row["la"]
         rec = await db.fetchrow("INSERT INTO admin_requests(user_id) VALUES($1) RETURNING id", uid)
         app_id = rec["id"]
-        text = (f"درخواست ادمینی از {mention_html(user)} (ID <code>{uid}</code>)\n"
+        text = (f"درخواست ادمینی از {await mention_name(context, uid)} (ID <code>{uid}</code>)\n"
                 f"آمار ۷ روزه:\n- مجموع پیام‌های چت: {cnt}\n- آخرین فعالیت: {la}")
         for dest in (GUARD_CHAT_ID, OWNER_ID):
             try:
@@ -1035,7 +1050,6 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Group message capture --------------------
 async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # فقط گروه اصلی
     if update.effective_chat.id != MAIN_CHAT_ID:
         return
 
@@ -1045,7 +1059,7 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user(u)
     await bump_member_stats(u.id)
 
-    # تشخیص ادمین: DB یا وضعیت واقعی
+    # تشخیص ادمین
     db_admin = await db.fetchrow(
         "SELECT 1 FROM users WHERE user_id=$1 AND (role IS NOT NULL OR $1=$2)",
         u.id, OWNER_ID
@@ -1057,25 +1071,29 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_admin = member.status in ("administrator", "creator") or (u.id == OWNER_ID)
         except Exception:
             is_admin = (u.id == OWNER_ID)
-
     if not is_admin:
         return
 
-    # آمار پیام ادمین
     await bump_admin_on_message(msg)
 
-    # اگر نوبت چت باز است، فقط آخرین فعالیت (در bump_admin_on_message هم آپدیت شد)
-    open_chat = await get_open_session(u.id, "chat")
-
-    # ح غ روشن: اگر هیچ نوبتی باز نیست → پاپ‌آپ + گزارش شروع فعالیت
     conf = await db.fetchrow("SELECT auto_mode FROM config WHERE id=TRUE")
     open_any = await get_open_session(u.id, None)
+
     if conf and conf["auto_mode"] and not open_any:
+        # 1) پاپ‌آپ در پی‌وی
         try:
             await context.bot.send_message(u.id, "نوع فعالیت را انتخاب کنید:", reply_markup=kb_checkin())
         except Exception:
-            await context.bot.send_message(GUARD_CHAT_ID, f"ℹ️ {mention_html(u)}: نتوانستم پاپ‌آپ در پی‌وی بفرستم.", parse_mode=ParseMode.HTML)
-        text = f"🟢 شروع فعالیت (بدون ثبت ورود): {mention_html(u)}\n— لطفاً ورود چت/کال را انتخاب کند."
+            await context.bot.send_message(GUARD_CHAT_ID, f"ℹ️ {await mention_name(context, u.id)}: نتوانستم پاپ‌آپ در پی‌وی بفرستم.", parse_mode=ParseMode.HTML)
+
+        # 2) پاپ‌آپ در گروه (ریپلای به پیام خودش)
+        try:
+            await msg.reply_text("نوع فعالیت را انتخاب کنید:", reply_markup=kb_checkin())
+        except Exception:
+            pass
+
+        # 3) گزارش شروع
+        text = f"🟢 شروع فعالیت (بدون ثبت ورود): {await mention_name(context, u.id)}\n— لطفاً ورود چت/کال را انتخاب کند."
         for dest in (GUARD_CHAT_ID, OWNER_ID):
             try:
                 await context.bot.send_message(dest, text, parse_mode=ParseMode.HTML)
@@ -1083,7 +1101,7 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # اگر نوبت چت باز بود، خروج خودکار با جاب هندل می‌شود
+    # اگر نوبت چت باز بود، خروج خودکار را job مدیریت می‌کند
 
 # -------------------- Daily jobs --------------------
 async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
@@ -1107,6 +1125,7 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
                COALESCE(s.chat_seconds,0) chat_seconds
         FROM users u LEFT JOIN daily_stats s ON s.d=$1 AND s.user_id=u.user_id
         WHERE u.role IS NOT NULL
+          AND u.role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
         ORDER BY
           CASE u.role
             WHEN 'senior_all' THEN 0
@@ -1120,10 +1139,10 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
     """, d)
     lines = [f"آمار کلی مدیران — {d}"]
     for a in agg:
-        lines.append(f"{a['role'] or '-'} | پیام: {a['chat_messages']} | کال: {human_td(a['call_seconds'])} | حضور: {human_td(a['chat_seconds'])}")
+        lines.append(f"{a['role'] or '-'} | {await mention_name(context, a['user_id'])} | پیام: {a['chat_messages']} | کال: {human_td(a['call_seconds'])} | حضور: {human_td(a['chat_seconds'])}")
     txt = "\n".join(lines)
     for ch in [GUARD_CHAT_ID, OWNER_ID]:
-        try: await context.bot.send_message(ch, txt, reply_markup=InlineKeyboardMarkup([[
+        try: await context.bot.send_message(ch, txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("👍 راضی", callback_data="rate_yes"),
             InlineKeyboardButton("👎 ناراضی", callback_data="rate_no")
         ]]))
@@ -1137,7 +1156,7 @@ async def send_candidates_report(context: ContextTypes.DEFAULT_TYPE):
     )
     lines = [f"۱۰ کاربر برتر چت ({d})"]
     for i, r in enumerate(rows, start=1):
-        lines.append(f"{i}. {mention_html(r['user_id'])} — پیام: {r['chat_count']}")
+        lines.append(f"{i}. {await mention_name(context, r['user_id'])} — پیام: {r['chat_count']}")
     try: await context.bot.send_message(OWNER_ID, "\n".join(lines), parse_mode=ParseMode.HTML)
     except Exception: pass
 
@@ -1149,7 +1168,7 @@ async def send_watchlist_reports(context: ContextTypes.DEFAULT_TYPE):
         uid = w["user_id"]
         r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", d, uid)
         if not r: continue
-        txt = (f"زیرنظر ({d}) برای {mention_html(uid)}:\n"
+        txt = (f"زیرنظر ({d}) برای {await mention_name(context, uid)}:\n"
                f"- پیام: {r['chat_messages']}, ریپلای ز/د: {r['replies_sent']}/{r['replies_received']}\n"
                f"- حضور چت: {human_td(r['chat_seconds'])}, کال: {human_td(r['call_seconds'])}")
         for ch in [GUARD_CHAT_ID, OWNER_ID]:
@@ -1163,15 +1182,8 @@ async def random_tag_job(context: ContextTypes.DEFAULT_TYPE):
     if not rows: return
     uid = rows[0]["user_id"]
     phrase = random.choice(FUN_LINES)
-    mention_text = "👋"
     try:
-        cm = await context.bot.get_chat_member(MAIN_CHAT_ID, uid)
-        display = (cm.user.first_name or "") + (" " + cm.user.last_name if cm.user.last_name else "")
-        mention_text = (display.strip() or (cm.user.username and "@"+cm.user.username) or "دوست")
-    except Exception:
-        pass
-    try:
-        await context.bot.send_message(MAIN_CHAT_ID, f"{phrase}\n<a href=\"tg://user?id={uid}\">{mention_text}</a>", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(MAIN_CHAT_ID, f"{phrase}\n<a href=\"tg://user?id={uid}\">👋</a>", parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -1217,8 +1229,8 @@ def build_app() -> Application:
 
     # پیام‌های گارد برای پاسخ ادمین‌ها
     app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) & ~filters.StatusUpdate.ALL, capture_admin_reply), group=1)
-    # پیام‌های مالک برای پاسخ به درخواست ادمینی
-    app.add_handler(MessageHandler((filters.Chat(OWNER_ID) & filters.TEXT) & ~filters.StatusUpdate.ALL, capture_owner_app_reply), group=1)
+    # پیام‌های مالک برای پاسخ به درخواست ادمینی — در هر چتی که مالک می‌نویسد
+    app.add_handler(MessageHandler(filters.User(OWNER_ID) & filters.TEXT & ~filters.StatusUpdate.ALL, capture_owner_app_reply), group=1)
 
     # پیام‌های گروه اصلی (آمار/ورود خودکار)
     app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & ~filters.StatusUpdate.ALL, group_message), group=2)
