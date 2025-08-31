@@ -895,9 +895,9 @@ def build_app() -> Application:
 
     # Group capture (main chat)
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.STICKER | filters.VOICE | filters.VIDEO | filters.ANIMATION) & filters.Chat(MAIN_CHAT_ID),
-        group_message
-    ))
+    filters.Chat(MAIN_CHAT_ID) & filters.UpdateType.MESSAGE,
+    group_message
+))
     return app
 
 if __name__ == "__main__":
