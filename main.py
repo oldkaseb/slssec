@@ -28,6 +28,7 @@ from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineK
                            ChatMemberUpdated)
 from aiogram.filters import CommandStart
 from aiogram.enums import ChatType, ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 # Persian (Jalali) date
 try:
@@ -340,7 +341,7 @@ class DB:
             return v if v is not None else default
 
 # ---------- BOT ----------
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 r_priv = Router()
 r_grp = Router()
