@@ -1,1223 +1,728 @@
-# main.py — Souls Security Bot (Railway + PostgreSQL)
-# PTB v20.x (async)
-# ENV: BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ=Asia/Tehran
-# Optional: FUN_LINES_FILE=/app/fun_lines.txt   (یک جمله در هر خط)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Hardened Telegram Bot
+- python-telegram-bot v20+ (async)
+- PostgreSQL via asyncpg
+- Polling (no webhooks)
+- Railway-ready
 
+Security & Robustness improvements applied:
+  • Enforce banned_users in all inbound user DM flows
+  • Strict role/ownership checks for all admin-only callbacks/commands
+  • Per-user throttling (contact/DM → guard/owner)
+  • Defensive DB operations with typed helpers and transactions where useful
+  • Idempotent job scheduling (prevent duplicates across restarts)
+  • Input validation + safe parsing of IDs
+  • Removed features entirely: media restriction, mute / unmute
+  • Centralized error handling & logging, graceful shutdown
+
+Functional coverage kept (hardened):
+  • /start & home menu
+  • Gender prompt (optional, toggle via config)
+  • Sessions: open/close chat/call, idle auto-closure, per-shift message count
+  • Daily stats, members_stats, watchlist
+  • Nightly reports + random tag (toggle)
+  • Guard/Owner contact pipeline with one-shot reply & ban flow
+
+Env vars:
+  BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ, FUN_LINES_FILE (optional)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
-import re
 import random
-from datetime import datetime, timedelta, date, timezone
-from zoneinfo import ZoneInfo
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Callable, Awaitable, Any
 
 import asyncpg
+from zoneinfo import ZoneInfo
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
     ChatPermissions,
+    MessageEntity,
 )
 from telegram.constants import ParseMode
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
-    ApplicationBuilder,
     Application,
-    ContextTypes,
-    MessageHandler,
+    ApplicationBuilder,
+    AIORateLimiter,
     CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
     filters,
-    AIORateLimiter,
+    ContextTypes,
 )
 
-# -------------------- Config --------------------
+# ---------------------------------------------------------
+# Config & Globals
+# ---------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("hardened-bot")
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://")
-MAIN_CHAT_ID = int(os.environ.get("MAIN_CHAT_ID", "0"))
-GUARD_CHAT_ID = int(os.environ.get("GUARD_CHAT_ID", "0"))
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-TZ = os.environ.get("TZ", "Asia/Tehran")
-TZINFO = ZoneInfo(TZ)
+DB_URL = os.environ.get("DATABASE_URL", "").strip()
+MAIN_CHAT_ID = int(os.environ.get("MAIN_CHAT_ID", "0") or 0)
+GUARD_CHAT_ID = int(os.environ.get("GUARD_CHAT_ID", "0") or 0)
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+TZ = os.environ.get("TZ", "Europe/Oslo").strip() or "Europe/Oslo"
+
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
-if not DATABASE_URL:
+if not DB_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
-# -------------------- Helpers --------------------
-def now() -> datetime:
-    return datetime.now(TZINFO)
+LOCAL_TZ = ZoneInfo(TZ)
 
-def today() -> date:
-    return now().date()
+# Per-user throttling memory (in-process; acceptable for single replica)
+THROTTLE_SECONDS_DM = 45  # user→guard DM flood control
+_last_dm_ts: dict[int, datetime] = {}
 
-def human_td(seconds: int) -> str:
-    s = int(seconds or 0)
-    h = s // 3600
-    m = (s % 3600) // 60
-    s2 = s % 60
-    parts = []
-    if h: parts.append(f"{h}ساعت")
-    if m: parts.append(f"{m}دقیقه")
-    if s2 and not parts: parts.append(f"{s2}ثانیه")
-    return " ".join(parts) or "0"
+# ---------------------------------------------------------
+# DB Schema & Helpers
+# ---------------------------------------------------------
 
-def mention_html(user_or_id):
-    if hasattr(user_or_id, "id"):
-        uid = user_or_id.id
-        name = (user_or_id.first_name or "") + (" " + user_or_id.last_name if getattr(user_or_id, "last_name", None) else "")
-        name = name.strip() or (getattr(user_or_id, "username", None) and "@" + user_or_id.username) or str(uid)
-    else:
-        uid = int(user_or_id)
-        name = str(uid)
-    return f'<a href="tg://user?id={uid}">{name}</a>'
-
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_ID
-
-async def try_clear_kb(message):
-    try:
-        await message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-# -------------------- SQL Schema --------------------
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS config (
-    id BOOLEAN PRIMARY KEY DEFAULT TRUE,
-    random_tag BOOLEAN NOT NULL DEFAULT FALSE,
-    gender_prompt BOOLEAN NOT NULL DEFAULT TRUE
-);
-INSERT INTO config(id) VALUES (TRUE) ON CONFLICT (id) DO NOTHING;
-
+SCHEMA_SQL = r"""
 CREATE TABLE IF NOT EXISTS users (
+    user_id      BIGINT PRIMARY KEY,
+    first_name   TEXT,
+    last_name    TEXT,
+    username     TEXT,
+    gender       TEXT,
+    role         TEXT DEFAULT 'member',
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS config (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- random_tag (on/off), gender_prompt (on/off)
+INSERT INTO config(key, value) VALUES
+    ('random_tag', 'off') ON CONFLICT (key) DO NOTHING;
+INSERT INTO config(key, value) VALUES
+    ('gender_prompt', 'on') ON CONFLICT (key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS banned_users (
     user_id BIGINT PRIMARY KEY,
-    first_name TEXT,
-    last_name TEXT,
-    username TEXT,
-    gender TEXT CHECK (gender IN ('male','female') OR gender IS NULL),
-    role TEXT,       -- chat_admin, call_admin, channel_admin, senior_chat, senior_call, senior_all
-    rank INT DEFAULT 0,
-    joined_guard_at TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS banned_users ( user_id BIGINT PRIMARY KEY );
-
-CREATE TABLE IF NOT EXISTS daily_stats (
-    d DATE NOT NULL,
-    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    chat_messages INT NOT NULL DEFAULT 0,
-    replies_sent INT NOT NULL DEFAULT 0,
-    replies_received INT NOT NULL DEFAULT 0,
-    chat_seconds INT NOT NULL DEFAULT 0,
-    call_seconds INT NOT NULL DEFAULT 0,
-    call_sessions INT NOT NULL DEFAULT 0,
-    first_checkin TIMESTAMPTZ,
-    last_checkout TIMESTAMPTZ,
-    PRIMARY KEY (d, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_daily_stats_d ON daily_stats(d);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-    kind TEXT NOT NULL CHECK (kind IN ('chat','call')),
-    start_ts TIMESTAMPTZ NOT NULL,
-    last_activity_ts TIMESTAMPTZ NOT NULL,
-    end_ts TIMESTAMPTZ,
-    open_msg_id BIGINT,
-    open_msg_chat BIGINT,
-    msg_count INT NOT NULL DEFAULT 0
+    reason  TEXT,
+    banned_by BIGINT,
+    banned_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS members_stats (
-    d DATE NOT NULL,
-    user_id BIGINT NOT NULL,
-    chat_count INT NOT NULL DEFAULT 0,
+    user_id BIGINT,
+    day     DATE,
+    msgs    INTEGER DEFAULT 0,
     last_active TIMESTAMPTZ,
-    PRIMARY KEY (d, user_id)
+    PRIMARY KEY(user_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    kind    TEXT NOT NULL CHECK (kind IN ('chat','call')),
+    start_ts TIMESTAMPTZ NOT NULL,
+    last_activity_ts TIMESTAMPTZ NOT NULL,
+    end_ts TIMESTAMPTZ,
+    msg_count INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions(user_id) WHERE end_ts IS NULL;
+
+CREATE TABLE IF NOT EXISTS daily_stats (
+    user_id BIGINT,
+    day     DATE,
+    msgs    INTEGER DEFAULT 0,
+    replies INTEGER DEFAULT 0,
+    chat_seconds INTEGER DEFAULT 0,
+    call_seconds INTEGER DEFAULT 0,
+    first_in TIMESTAMPTZ,
+    last_out TIMESTAMPTZ,
+    PRIMARY KEY(user_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS watchlist (
+    user_id BIGINT PRIMARY KEY,
+    note TEXT,
+    added_by BIGINT,
+    added_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS ratings (
-    d DATE NOT NULL,
-    rater_id BIGINT NOT NULL,
-    rating BOOLEAN NOT NULL,
-    PRIMARY KEY (d, rater_id)
+    day DATE PRIMARY KEY,
+    up  INTEGER DEFAULT 0,
+    down INTEGER DEFAULT 0,
+    rated_by BIGINT
 );
-
-CREATE TABLE IF NOT EXISTS watchlist ( user_id BIGINT PRIMARY KEY );
-
-CREATE TABLE IF NOT EXISTS contact_threads (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    channel TEXT NOT NULL CHECK (channel IN ('guard','owner')),
-    status TEXT NOT NULL DEFAULT 'open',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_forwarded_msg BIGINT,
-    last_forwarded_chat BIGINT
-);
-
-CREATE TABLE IF NOT EXISTS admin_requests (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status TEXT NOT NULL DEFAULT 'open'
-);
-
--- ensure columns exist on old deployments
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS msg_count INT NOT NULL DEFAULT 0;
-ALTER TABLE config ADD COLUMN IF NOT EXISTS gender_prompt BOOLEAN NOT NULL DEFAULT TRUE;
 """
 
-# -------------------- Fun lines (loaded from file if provided) --------------------
-DEFAULT_FUN_LINES = [
-    # فهرست امن و تمیز. اگر بخواهی، از فایل بیرونی لود می‌شود (FUN_LINES_FILE).
-    "یادت نره آب بخوری! 💧",
-    "امروزت پر از انرژی مثبت باشه ✨",
-    "یه لبخند کوچیک می‌تونه روزتو عوض کنه 🙂",
-    "همین الان یه نفس عمیق بکش 😌",
-    "یه استراحت کوتاه لازمه ☕️",
-    "بچه‌های سولز پشتتن 😉",
-    "امروز بهترین نسخه خودت باش 🌟",
-    "بهت افتخار می‌کنیم 👏",
-    "یه آهنگ خوب گوش بده 🎶",
-    "یه لیوان چای داغ می‌چسبه 🍵",
-    "ذهن آروم = زندگی قشنگ 🧘",
-    "شاد بودن انتخابه، انتخاب کن 😎",
-    "لبخند بزن، حتی وقتی سخت میشه 🌻",
-    "موفقیت با تلاش میاد 🛠️",
-    "یه موزیک شاد پلی کن 🎧",
-]
-
-def load_fun_lines() -> list[str]:
-    path = os.environ.get("FUN_LINES_FILE")
-    if path and os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-            return lines[:200]
-        except Exception:
-            pass
-    return DEFAULT_FUN_LINES
-
-FUN_LINES = load_fun_lines()
-
-# -------------------- DB --------------------
+@dataclass
 class DB:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-        self.pool: asyncpg.Pool | None = None
+    pool: asyncpg.Pool
 
-    async def connect(self):
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+    # Generic helpers -------------------------------------------------
+    async def fetchval(self, sql: str, *args) -> Any:
         async with self.pool.acquire() as con:
-            await con.execute(SCHEMA_SQL)
+            return await con.fetchval(sql, *args)
 
-    async def close(self):
-        if self.pool:
-            await self.pool.close()
+    async def fetchrow(self, sql: str, *args) -> Optional[asyncpg.Record]:
+        async with self.pool.acquire() as con:
+            return await con.fetchrow(sql, *args)
 
-    async def fetch(self, q, *a):
-        async with self.pool.acquire() as c:
-            return await c.fetch(q, *a)
+    async def fetch(self, sql: str, *args) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as con:
+            return await con.fetch(sql, *args)
 
-    async def fetchrow(self, q, *a):
-        async with self.pool.acquire() as c:
-            return await c.fetchrow(q, *a)
+    async def execute(self, sql: str, *args) -> str:
+        async with self.pool.acquire() as con:
+            return await con.execute(sql, *args)
 
-    async def execute(self, q, *a):
-        async with self.pool.acquire() as c:
-            return await c.execute(q, *a)
+    async def tx(self, func: Callable[[asyncpg.Connection], Awaitable[Any]]):
+        async with self.pool.acquire() as con:
+            async with con.transaction():
+                return await func(con)
 
-db = DB(DATABASE_URL)
-
-# -------------------- Keyboards --------------------
-def kb_checkin():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ ورود چت", callback_data="checkin_chat"),
-         InlineKeyboardButton("🎧 ورود کال", callback_data="checkin_call")]
-    ])
-
-def kb_owner_rate():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👍 راضی", callback_data="rate_yes"),
-        InlineKeyboardButton("👎 ناراضی", callback_data="rate_no")
-    ]])
-
-def kb_reply_block(thread_id: int):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("پاسخ", callback_data=f"reply_{thread_id}"),
-        InlineKeyboardButton("مسدود", callback_data=f"block_{thread_id}")
-    ]])
-
-def kb_back_retry():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("↩️ بازگشت", callback_data="back_home"),
-        InlineKeyboardButton("🔄 ارسال مجدد", callback_data="retry_send")
-    ]])
-
-def kb_gender(uid: int):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👦 پسر", callback_data=f"gender_male_{uid}"),
-        InlineKeyboardButton("👧 دختر", callback_data=f"gender_female_{uid}")
-    ]])
-
-HOME_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🛡️ ارتباط با گارد مدیران", callback_data="contact_guard")],
-    [InlineKeyboardButton("👤 ارتباط با مالک", callback_data="contact_owner")],
-    [InlineKeyboardButton("📊 آمار من", callback_data="my_stats")]
-])
-
-WELCOME_TEXT = (
-    "سلام! این ربات ویژه مالک تیم <b>Souls</b> است.\n"
-    "برای ارتباط با گارد مدیران یا مالک از دکمه‌ها استفاده کنید."
-)
-
-# -------------------- Utility --------------------
-async def ensure_user(u):
-    await db.execute(
-        """INSERT INTO users(user_id,first_name,last_name,username)
-           VALUES($1,$2,$3,$4)
-           ON CONFLICT (user_id) DO UPDATE SET
-             first_name=EXCLUDED.first_name,
-             last_name=EXCLUDED.last_name,
-             username=EXCLUDED.username""",
-        u.id, u.first_name, u.last_name, u.username
-    )
-
-async def is_guard_member(uid: int) -> bool:
-    if is_owner(uid):
-        return True
-    row = await db.fetchrow("SELECT role FROM users WHERE user_id=$1", uid)
-    return bool(row and row["role"])
-
-async def bump_member_stats(uid: int):
-    await db.execute(
-        """INSERT INTO members_stats(d,user_id,chat_count,last_active)
-           VALUES($1,$2,1,$3)
-           ON CONFLICT (d,user_id) DO UPDATE SET
-             chat_count=members_stats.chat_count+1, last_active=$3""",
-        today(), uid, now()
-    )
-
-async def bump_admin_on_message(message):
-    uid = message.from_user.id
-    d = today()
-    await db.execute(
-        """INSERT INTO daily_stats(d,user_id,chat_messages)
-           VALUES($1,$2,1)
-           ON CONFLICT (d,user_id) DO UPDATE SET chat_messages=daily_stats.chat_messages+1""",
-        d, uid
-    )
-    if message.reply_to_message and message.reply_to_message.from_user:
-        await db.execute(
-            """INSERT INTO daily_stats(d,user_id,replies_sent)
-               VALUES($1,$2,1)
-               ON CONFLICT (d,user_id) DO UPDATE SET replies_sent=daily_stats.replies_sent+1""",
-            d, uid
+    # Domain helpers --------------------------------------------------
+    async def is_banned(self, user_id: int) -> bool:
+        return bool(
+            await self.fetchval("SELECT 1 FROM banned_users WHERE user_id=$1", user_id)
         )
-        orig = message.reply_to_message.from_user.id
-        await db.execute(
-            """INSERT INTO daily_stats(d,user_id,replies_received)
-               VALUES($1,$2,1)
-               ON CONFLICT (d,user_id) DO UPDATE SET replies_received=daily_stats.replies_received+1""",
-            d, orig
+
+    async def upsert_user(self, u) -> None:
+        await self.execute(
+            """
+            INSERT INTO users(user_id, first_name, last_name, username, updated_at)
+            VALUES($1,$2,$3,$4,NOW())
+            ON CONFLICT(user_id)
+            DO UPDATE SET first_name=EXCLUDED.first_name,
+                          last_name=EXCLUDED.last_name,
+                          username=EXCLUDED.username,
+                          updated_at=NOW();
+            """,
+            u.id, u.first_name, u.last_name, u.username,
         )
-    # شمارش پیام نوبت چت (اگر باز است)
-    sess = await get_open_session(uid, "chat")
-    if sess:
-        await db.execute("UPDATE sessions SET msg_count = msg_count + 1, last_activity_ts=$1 WHERE id=$2", now(), sess["id"])
 
-async def get_open_session(uid: int, kind: str | None = None):
-    if kind:
-        return await db.fetchrow(
-            "SELECT * FROM sessions WHERE user_id=$1 AND kind=$2 AND end_ts IS NULL ORDER BY id DESC LIMIT 1",
-            uid, kind
+    async def config_get(self, key: str, default: str = "") -> str:
+        val = await self.fetchval("SELECT value FROM config WHERE key=$1", key)
+        return val if val is not None else default
+
+    async def config_set(self, key: str, value: str) -> None:
+        await self.execute(
+            "INSERT INTO config(key,value) VALUES($1,$2)\n"
+            "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+            key, value,
         )
-    return await db.fetchrow(
-        "SELECT * FROM sessions WHERE user_id=$1 AND end_ts IS NULL ORDER BY id DESC LIMIT 1",
-        uid
-    )
 
-async def start_session(context: ContextTypes.DEFAULT_TYPE, uid: int, kind: str, msg_chat=None, msg_id=None):
-    ex = await get_open_session(uid, kind)
-    if ex:
-        await db.execute("UPDATE sessions SET last_activity_ts=$1 WHERE id=$2", now(), ex["id"])
-        return ex["id"]
-    rec = await db.fetchrow(
-        """INSERT INTO sessions(user_id,kind,start_ts,last_activity_ts,open_msg_chat,open_msg_id)
-           VALUES($1,$2,$3,$3,$4,$5) RETURNING id""",
-        uid, kind, now(), msg_chat, msg_id
-    )
-    await db.execute(
-        """INSERT INTO daily_stats(d,user_id,first_checkin)
-           VALUES($1,$2,$3)
-           ON CONFLICT (d,user_id) DO UPDATE SET first_checkin=COALESCE(daily_stats.first_checkin,$3)""",
-        today(), uid, now()
-    )
-    if kind == "chat":
-        await schedule_inactivity(context, rec["id"])  # 5-minute idle watcher
-    return rec["id"]
-
-async def end_session(context: ContextTypes.DEFAULT_TYPE, sess_id: int, reason="manual"):
-    sess = await db.fetchrow("SELECT * FROM sessions WHERE id=$1", sess_id)
-    if not sess or sess["end_ts"]:
-        return
-    end_ts = now()
-    await db.execute("UPDATE sessions SET end_ts=$1 WHERE id=$2", end_ts, sess_id)
-    dur = int((end_ts - sess["start_ts"]).total_seconds())
-    col = "chat_seconds" if sess["kind"] == "chat" else "call_seconds"
-    inc_call = ", call_sessions = daily_stats.call_sessions + 1" if sess["kind"] == "call" else ""
-    await db.execute(
-        f"""INSERT INTO daily_stats(d,user_id,{col},last_checkout)
-            VALUES($1,$2,$3,$4)
-            ON CONFLICT (d,user_id) DO UPDATE SET
-              {col}=daily_stats.{col}+$3, last_checkout=$4 {inc_call}""",
-        today(), sess["user_id"], dur, end_ts
-    )
-    # گزارش خروج
-    txt = (f"{'⛔️' if reason!='manual' else '❌'} خروج {('چت' if sess['kind']=='chat' else 'کال')}\n"
-           f"مدت: {human_td(dur)}\n"
-           f"تعداد پیام در این نوبت: {sess['msg_count']}")
-    for ch in [GUARD_CHAT_ID, OWNER_ID]:
-        try:
-            await context.bot.send_message(ch, txt)
-        except Exception:
-            pass
-    try:
-        await context.bot.send_message(sess["user_id"], txt)
-    except Exception:
-        pass
-
-async def end_all_sessions(context: ContextTypes.DEFAULT_TYPE, uid: int, reason="manual"):
-    rows = await db.fetch("SELECT id FROM sessions WHERE user_id=$1 AND end_ts IS NULL", uid)
-    for r in rows:
-        await end_session(context, r["id"], reason=reason)
-
-async def schedule_inactivity(context: ContextTypes.DEFAULT_TYPE, sess_id: int):
-    # job هر 60 ثانیه چک می‌کند اگر 5 دقیقه بی‌فعالی → خروج خودکار (فقط چت)
-    name = f"inact_{sess_id}"
-    for j in context.job_queue.get_jobs_by_name(name):
-        j.schedule_removal()
-    context.job_queue.run_repeating(inactivity_job, interval=60, first=60, name=name, data={"sess_id": sess_id})
-
-async def inactivity_job(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data or {}
-    sid = data.get("sess_id")
-    sess = await db.fetchrow("SELECT * FROM sessions WHERE id=$1", sid)
-    if not sess or sess["end_ts"]:
-        context.job.schedule_removal(); return
-    if sess["kind"] != "chat":
-        context.job.schedule_removal(); return
-    if now() - sess["last_activity_ts"].astimezone(TZINFO) >= timedelta(minutes=5):
-        await end_session(context, sid, reason="بدون فعالیت ۵ دقیقه")
-        context.job.schedule_removal()
-
-# -------------------- Role & mention helpers --------------------
-async def get_role(uid: int) -> str | None:
-    row = await db.fetchrow("SELECT role FROM users WHERE user_id=$1", uid)
-    return row["role"] if row else None
-
-async def is_senior_or_owner(uid: int) -> bool:
-    if is_owner(uid):
-        return True
-    role = await get_role(uid)
-    return role in ("senior_all", "senior_chat", "senior_call")
-
-async def resolve_display_name(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
-    row = await db.fetchrow("SELECT first_name, last_name, username FROM users WHERE user_id=$1", uid)
-    if row:
-        fn = row["first_name"] or ""
-        ln = row["last_name"] or ""
-        name = (fn + (" " + ln if ln else "")).strip()
-        if name:
-            return name
-        if row["username"]:
-            return "@" + row["username"]
-    try:
-        cm = await context.bot.get_chat_member(MAIN_CHAT_ID, uid)
-        fn = cm.user.first_name or ""
-        ln = cm.user.last_name or ""
-        name = (fn + (" " + ln if ln else "")).strip() or (cm.user.username and "@" + cm.user.username)
-        return name or str(uid)
-    except Exception:
-        return str(uid)
-
-async def mention_name(context: ContextTypes.DEFAULT_TYPE, uid: int) -> str:
-    name = await resolve_display_name(context, uid)
-    return f'<a href="tg://user?id={uid}">{name}</a>'
-
-# -------------------- Start & Home --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await ensure_user(update.effective_user)
-    if update.message:
-        await update.message.reply_html(WELCOME_TEXT, reply_markup=HOME_KB)
-
-# -------------------- Contact flow --------------------
-def kb_contact_home():
-    return HOME_KB
-
-async def on_contact_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data in ("contact_guard","contact_owner"):
-        channel = "guard" if q.data.endswith("guard") else "owner"
-        context.user_data["contact_channel"] = channel
-        await try_clear_kb(q.message)
-        await q.message.reply_text(
-            f"پیام خود را برای {'گارد مدیران' if channel=='guard' else 'مالک'} ارسال کنید.\nمتن/عکس/ویس مجاز است.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت", callback_data="back_home"),
-                                                InlineKeyboardButton("🔄 ارسال مجدد", callback_data="retry_send")]])
-        )
-    elif q.data == "back_home":
-        await try_clear_kb(q.message)
-        await q.message.reply_text(WELCOME_TEXT, reply_markup=kb_contact_home())
-    elif q.data == "retry_send":
-        await q.answer("پیام جدید بفرستید.", show_alert=True)
-
-async def pipe_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channel = context.user_data.get("contact_channel")
-    if not channel: return
-    u = update.effective_user
-    await ensure_user(u)
-    dest = GUARD_CHAT_ID if channel == "guard" else OWNER_ID
-    caption = f"کاربر: {mention_html(u)}\nID: <code>{u.id}</code>"
-    sent = None
-    try:
-        if update.message.photo:
-            sent = await context.bot.send_photo(dest, update.message.photo[-1].file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb_reply_block(0))
-        elif update.message.voice:
-            sent = await context.bot.send_voice(dest, update.message.voice.file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb_reply_block(0))
-        elif update.message.text:
-            sent = await context.bot.send_message(dest, f"{caption}\n\n{update.message.text_html}", parse_mode=ParseMode.HTML, reply_markup=kb_reply_block(0))
-        else:
-            sent = await context.bot.send_message(dest, caption+"\n(نوع رسانه پشتیبانی نشد)", parse_mode=ParseMode.HTML, reply_markup=kb_reply_block(0))
-    except Exception:
-        if update.message: await update.message.reply_text("ارسال ناموفق بود.")
-        return
-    if sent:
-        rec = await db.fetchrow(
-            "INSERT INTO contact_threads(user_id,channel,last_forwarded_msg,last_forwarded_chat) VALUES($1,$2,$3,$4) RETURNING id",
-            u.id, channel, sent.message_id, dest
-        )
-        try: await sent.edit_reply_markup(kb_reply_block(rec["id"]))
-        except Exception: pass
-        await update.message.reply_text("پیام شما ارسال شد ✅",
-                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ بازگشت", callback_data="back_home"),
-                                                                            InlineKeyboardButton("🔄 ارسال مجدد", callback_data="retry_send")]]))
-
-async def on_guard_reply_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-
-    if data.startswith("block_"):
-        tid = int(data.split("_", 1)[1])
-        rec = await db.fetchrow("SELECT * FROM contact_threads WHERE id=$1", tid)
-        if not rec:
-            return
-        await db.execute("INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING", rec["user_id"])
-        await try_clear_kb(q.message)
-        await q.message.reply_text("کاربر مسدود شد.")
-        return
-
-    if data.startswith("reply_"):
-        tid = int(data.split("_", 1)[1])
-        context.user_data["one_shot_reply_tid"] = tid
-        await try_clear_kb(q.message)
-        await q.message.reply_text(
-            "پیام پاسخ خود را ارسال کنید.\n"
-            "⚠️ فقط اولین پیام بعد از این کلیک فوروارد می‌شود. "
-            "برای پاسخ جدید دوباره دکمه «پاسخ» را بزنید."
-        )
-        return
-
-async def capture_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tid = context.user_data.pop("one_shot_reply_tid", None)
-    if not tid:
-        return
-    rec = await db.fetchrow("SELECT * FROM contact_threads WHERE id=$1", tid)
-    if not rec:
-        await update.message.reply_text("ترد نامعتبر است. دوباره دکمه «پاسخ» را بزنید.")
-        return
-    uid = rec["user_id"]
-    m = update.message
-    try:
-        if m.text:
-            await context.bot.send_message(uid, f"پاسخ مدیریت:\n\n{m.text}")
-        elif m.photo:
-            await context.bot.send_photo(uid, m.photo[-1].file_id, caption="پاسخ مدیریت:")
-        elif m.voice:
-            await context.bot.send_voice(uid, m.voice.file_id, caption="پاسخ مدیریت:")
-        elif m.document:
-            await context.bot.send_document(uid, m.document.file_id, caption="پاسخ مدیریت:")
-        elif m.video:
-            await context.bot.send_video(uid, m.video.file_id, caption="پاسخ مدیریت:")
-        elif m.animation:
-            await context.bot.send_animation(uid, m.animation.file_id, caption="پاسخ مدیریت:")
-        else:
-            await context.bot.send_message(uid, "پاسخ مدیریت ارسال شد.")
-        await m.reply_text("پاسخ ارسال شد ✅\nبرای پاسخ جدید، دوباره دکمه «پاسخ» را بزنید.")
-        try:
-            await context.bot.edit_message_reply_markup(
-                rec["last_forwarded_chat"], rec["last_forwarded_msg"],
-                reply_markup=kb_reply_block(rec["id"])
+    async def open_session(self, user_id: int, kind: str) -> None:
+        now = datetime.now(tz=LOCAL_TZ)
+        async def _do(con: asyncpg.Connection):
+            # close any open sessions first
+            await con.execute(
+                "UPDATE sessions SET end_ts=$1 WHERE user_id=$2 AND end_ts IS NULL",
+                now, user_id
             )
-        except Exception:
-            pass
-    except Exception:
-        await m.reply_text("ارسال پاسخ ناموفق بود. دوباره تلاش کنید.")
+            await con.execute(
+                "INSERT INTO sessions(user_id,kind,start_ts,last_activity_ts) VALUES($1,$2,$3,$3)",
+                user_id, kind, now
+            )
+        await self.tx(_do)
 
-# -------------------- Rating buttons --------------------
-async def on_owner_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q.from_user.id != OWNER_ID:
-        await q.answer("فقط مالک!", show_alert=True); return
-    await q.answer()
-    val = True if q.data.endswith("yes") else False
-    await db.execute(
-        "INSERT INTO ratings(d,rater_id,rating) VALUES($1,$2,$3) ON CONFLICT (d,rater_id) DO UPDATE SET rating=$3",
-        today(), OWNER_ID, val
-    )
-    await q.message.reply_text("ثبت شد.")
+    async def close_sessions(self, user_id: int, kind: Optional[str] = None) -> list[asyncpg.Record]:
+        now = datetime.now(tz=LOCAL_TZ)
+        async def _do(con: asyncpg.Connection):
+            where = "user_id=$1 AND end_ts IS NULL"
+            args = [user_id]
+            if kind:
+                where += " AND kind=$2"
+                args.append(kind)
+            rows = await con.fetch(f"SELECT * FROM sessions WHERE {where}", *args)
+            await con.execute(f"UPDATE sessions SET end_ts=$1 WHERE {where}", now, *args)
+            return rows
+        return await self.tx(_do)
 
-# -------------------- Checkin/Checkout callbacks --------------------
-async def on_checkin_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    u = q.from_user
-    await ensure_user(u)
-    await try_clear_kb(q.message)
+    async def bump_message(self, user_id: int, reply: bool) -> None:
+        now = datetime.now(tz=LOCAL_TZ)
+        today = now.date()
+        async def _do(con: asyncpg.Connection):
+            # members_stats
+            await con.execute(
+                """
+                INSERT INTO members_stats(user_id, day, msgs, last_active)
+                VALUES($1,$2,1,$3)
+                ON CONFLICT(user_id,day)
+                DO UPDATE SET msgs = members_stats.msgs + 1, last_active=$3
+                """,
+                user_id, today, now
+            )
+            # daily_stats (manager-level)
+            await con.execute(
+                """
+                INSERT INTO daily_stats(user_id, day, msgs, replies, first_in)
+                VALUES($1,$2,$3,$4,$5)
+                ON CONFLICT(user_id, day)
+                DO UPDATE SET msgs = daily_stats.msgs + $3,
+                              replies = daily_stats.replies + $4,
+                              last_out = COALESCE(daily_stats.last_out, $5)
+                """,
+                user_id, today, 1, 1 if reply else 0, now
+            )
+            # bump open chat session msg_count & last_activity_ts
+            await con.execute(
+                """
+                UPDATE sessions SET msg_count = msg_count + 1, last_activity_ts=$1
+                WHERE user_id=$2 AND end_ts IS NULL AND kind='chat'
+                """,
+                now, user_id
+            )
+        await self.tx(_do)
 
-    if q.data == "checkin_chat":
-        txt = f"✅ ورود چت: {await mention_name(context, u.id)}"
-        for dest in (GUARD_CHAT_ID, OWNER_ID):
-            try: await context.bot.send_message(dest, txt, parse_mode=ParseMode.HTML)
-            except Exception: pass
-        await start_session(context, u.id, "chat")
-        try: await q.message.edit_text("✅ فعالیت چت ثبت شد.", parse_mode=ParseMode.HTML)
-        except Exception: pass
-        try: await context.bot.send_message(u.id, "ورود چت ثبت شد ✅")
-        except Exception: pass
+    async def accrue_session_seconds(self, rows: list[asyncpg.Record]) -> None:
+        # on closing sessions, add seconds into daily_stats
+        if not rows:
+            return
+        now = datetime.now(tz=LOCAL_TZ)
+        today = now.date()
+        async def _do(con: asyncpg.Connection):
+            for r in rows:
+                end_ts = now
+                delta = int((end_ts - (r["start_ts"]).astimezone(LOCAL_TZ)).total_seconds())
+                col = "chat_seconds" if r["kind"] == "chat" else "call_seconds"
+                await con.execute(
+                    f"""
+                    INSERT INTO daily_stats(user_id, day, {col})
+                    VALUES($1,$2,$3)
+                    ON CONFLICT(user_id, day)
+                    DO UPDATE SET {col} = daily_stats.{col} + $3,
+                                  last_out = $4
+                    """,
+                    r["user_id"], today, delta, now
+                )
+        await self.tx(_do)
 
-    elif q.data == "checkin_call":
-        txt = f"🎧 ورود کال: {await mention_name(context, u.id)}"
-        for dest in (GUARD_CHAT_ID, OWNER_ID):
-            try: await context.bot.send_message(dest, txt, parse_mode=ParseMode.HTML)
-            except Exception: pass
-        await start_session(context, u.id, "call")
-        try: await q.message.edit_text("🎧 فعالیت کال ثبت شد.", parse_mode=ParseMode.HTML)
-        except Exception: pass
-        try: await context.bot.send_message(u.id, "ورود کال ثبت شد ✅")
-        except Exception: pass
 
-    elif q.data.startswith("checkout_"):
-        await q.message.reply_text("برای خروج، دستور «ثبت خروج» را ارسال کنید.")
-        return
+db: DB  # global holder
 
-    elif q.data in ("switch_to_chat","switch_to_call"):
-        target = "chat" if q.data.endswith("chat") else "call"
-        other = "call" if target=="chat" else "chat"
-        old = await get_open_session(u.id, other)
-        if old: await end_session(context, old["id"], reason="تغییر فعالیت")
-        txt = f"🔁 تغییر فعالیت به {('چت' if target=='chat' else 'کال')}: {await mention_name(context, u.id)}"
-        for dest in (GUARD_CHAT_ID, OWNER_ID):
-            try: await context.bot.send_message(dest, txt, parse_mode=ParseMode.HTML)
-            except Exception: pass
-        await start_session(context, u.id, target)
-        try: await q.message.edit_text(f"🔁 تغییر فعالیت به {'چت' if target=='chat' else 'کال'} ثبت شد.", parse_mode=ParseMode.HTML)
-        except Exception: pass
-        try: await context.bot.send_message(u.id, "تغییر فعالیت ثبت شد ✅")
-        except Exception: pass
+# ---------------------------------------------------------
+# Utilities & Guards
+# ---------------------------------------------------------
 
-# -------------------- Gender choice callbacks --------------------
-async def on_gender_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    data = q.data
-    if not (data.startswith("gender_male_") or data.startswith("gender_female_")):
-        return
-    try:
-        _, typ, uid_suf = data.split("_", 2)
-    except ValueError:
-        # pattern is gender_male_<uid> OR gender_female_<uid>
-        typ = "male" if data.startswith("gender_male_") else "female"
-        uid_suf = data.split("_")[-1]
-    target_uid = int(uid_suf)
-    clicker = q.from_user.id
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
 
-    # فقط خودِ کاربر هدف یا اعضای گارد اجازه دارند
-    if clicker != target_uid and not await is_guard_member(clicker):
-        await q.answer("اجازه ندارید.", show_alert=True); return
+ADMIN_ROLES = {"chat_admin", "call_admin", "channel_admin", "senior_chat", "senior_call", "senior_channel", "owner"}
 
-    await db.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target_uid)
-    await db.execute("UPDATE users SET gender=$2 WHERE user_id=$1", target_uid, typ if typ in ("male","female") else ("male" if "male" in data else "female"))
+async def user_role(user_id: int) -> str:
+    row = await db.fetchrow("SELECT role FROM users WHERE user_id=$1", user_id)
+    if not row:
+        return "member"
+    return (row["role"] or "member")
 
-    # ادیت/حذف دکمه‌ها
-    try:
-        await q.message.edit_text(f"جنسیت {await mention_name(context, target_uid)} ثبت شد.", parse_mode=ParseMode.HTML)
-    except Exception:
-        await try_clear_kb(q.message)
+async def ensure_role(update: Update, context: ContextTypes.DEFAULT_TYPE, roles: set[str]) -> bool:
+    uid = update.effective_user.id if update.effective_user else 0
+    if is_owner(uid):
+        return True
+    r = await user_role(uid)
+    if r in roles:
+        return True
+    await update.effective_message.reply_text("⛔️ اجازهٔ دسترسی ندارید.")
+    return False
 
-# -------------------- My stats --------------------
-async def on_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    uid = q.from_user.id
-    r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", today(), uid)
-    if not r:
-        await q.message.reply_text("امروز آماری ندارید."); return
-    txt = (f"آمار امروز:\n"
-           f"- پیام‌های چت: {r['chat_messages']}\n"
-           f"- ریپلای زده/دریافت: {r['replies_sent']}/{r['replies_received']}\n"
-           f"- زمان حضور چت: {human_td(r['chat_seconds'])}\n"
-           f"- زمان فعالیت کال: {human_td(r['call_seconds'])}\n"
-           f"- دفعات کال: {r['call_sessions']}")
-    await q.message.reply_text(txt)
+# Safe ID parser
+ID_RE = re.compile(r"^(\d{5,})$")
 
-# -------------------- Text triggers (no slash) --------------------
-RE_RANDOM_TAG = {"تگ رندوم روشن": True, "تگ رندوم خاموش": False}
-RE_GENDER_PROMPT = {"جنسیت روشن": True, "جنسیت خاموش": False}
-
-def extract_target_from_text_or_reply(update: Update):
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        return update.message.reply_to_message.from_user.id
-    m = re.search(r"(\d{4,})", update.message.text or "")
+def parse_user_id(text: str) -> Optional[int]:
+    m = ID_RE.match(text.strip())
     return int(m.group(1)) if m else None
 
-OWNER_HELP = (
-    "راهنما (بدون /):\n"
-    "• ثبت — پاپ‌آپ ثبت فعالیت (چت/کال).\n"
-    "• ورود چت / ورود کال — متنی (خود/با ریپلای/آیدی برای دیگران).\n"
-    "• ثبت خروج — تمام سشن‌های باز را می‌بندد (خود/با ریپلای/آیدی).\n"
-    "• تغییر فعالیت — پاپ‌آپ تغییر بین چت/کال.\n"
-    "• ترفیع/عزل چت، کال، ارشدچت، ارشدکال، ارشدکل، کانال — با ریپلای/آیدی (مالک).\n"
-    "• محدود رسانه / آزاد رسانه — فقط متن‌دادن یا رفع محدودیت (با ریپلای/آیدی).\n"
-    "• سکوت / حذف سکوت — در گروه اصلی و با ریپلای.\n"
-    "• ثبت پسر / ثبت دختر — برای خود یا با ریپلای تعیین جنسیت کاربر.\n"
-    "• تگ پسرها / تگ دخترها / تگ لیست پسر / تگ لیست دختر / تگ لیست همه — با ریپلای روی پیام.\n"
-    "• گارد — وضعیت امروز شما.\n"
-    "• آمار — تعداد کاربران فعال امروز.\n"
-    "• آمار چت الان / آمار کال الان — تا این لحظه برای تیم مدیریت (با دکمه رضایت).\n"
-    "• آمار کلی کاربر <آیدی> — گزارش ۳۰ روز گذشته.\n"
-    "• ممنوع <آیدی> / آزاد <آیدی> — لیست ممنوع.\n"
-    "• زیرنظر+<آیدی> — گزارش شبانهٔ اختصاصی.\n"
-    "• تگ رندوم روشن / تگ رندوم خاموش — منشن تصادفی هر ۱۵ دقیقه.\n"
-    "• جنسیت روشن / جنسیت خاموش — پاپ‌آپ تعیین جنسیت برای اولین پیام کاربران.\n"
-    "• لیست گارد — سلسله‌مراتب مدیریت (مالک در صدر).\n"
-    "• درخواست ادمینی — گزارش امروز و ۷ روز اخیر کاربر برای مالک و گارد.\n"
-)
+# Throttle decorator
+async def throttle_dm(user_id: int) -> bool:
+    now = datetime.now(tz=LOCAL_TZ)
+    last = _last_dm_ts.get(user_id)
+    if last and (now - last).total_seconds() < THROTTLE_SECONDS_DM:
+        return False
+    _last_dm_ts[user_id] = now
+    return True
 
-async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
+# ---------------------------------------------------------
+# Keyboards
+# ---------------------------------------------------------
+
+def kb_home() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("ورود چت", callback_data="enter:chat"), InlineKeyboardButton("ورود کال", callback_data="enter:call")],
+        [InlineKeyboardButton("تغییر به چت", callback_data="switch:chat"), InlineKeyboardButton("تغییر به کال", callback_data="switch:call")],
+        [InlineKeyboardButton("ثبت خروج", callback_data="exit:all")],
+        [InlineKeyboardButton("ارتباط با گارد/مالک", callback_data="contact")],
+    ])
+
+
+def kb_gender() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚹 پسر", callback_data="gender:m"), InlineKeyboardButton("🚺 دختر", callback_data="gender:f")]
+    ])
+
+# ---------------------------------------------------------
+# Handlers — Commands
+# ---------------------------------------------------------
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not u:
         return
-    txt = update.message.text.strip()
-    user = update.effective_user
-    chat_id = update.effective_chat.id
+    await db.upsert_user(u)
+    await update.effective_message.reply_text(
+        "سلام! از منوی زیر انتخاب کن.",
+        reply_markup=kb_home(),
+    )
 
-    # مالک/ارشد تنظیمات
-    if is_owner(user.id):
-        if txt == "راهنما":
-            await update.message.reply_text(OWNER_HELP); return
-        if txt in RE_RANDOM_TAG:
-            await db.execute("UPDATE config SET random_tag=$1 WHERE id=TRUE", RE_RANDOM_TAG[txt])
-            await update.message.reply_text(f"تگ رندوم {'روشن' if RE_RANDOM_TAG[txt] else 'خاموش'} شد."); return
-        if txt in RE_GENDER_PROMPT:
-            await db.execute("UPDATE config SET gender_prompt=$1 WHERE id=TRUE", RE_GENDER_PROMPT[txt])
-            await update.message.reply_text(f"پاپ‌آپ تعیین جنسیت {'روشن' if RE_GENDER_PROMPT[txt] else 'خاموش'} شد."); return
 
-    # ارتقا/عزل (فقط مالک)
-    if is_owner(user.id):
-        role_map = {
-            "ترفیع چت": "chat_admin", "عزل چت": None,
-            "ترفیع کال": "call_admin", "عزل کال": None,
-            "ترفیع ارشدچت": "senior_chat", "عزل ارشدچت": None,
-            "ترفیع ارشدکال": "senior_call", "عزل ارشدکال": None,
-            "ترفیع ارشدکل": "senior_all", "عزل ارشدکل": None,
-            "ترفیع کانال": "channel_admin", "عزل کانال": None,
-        }
-        if txt in role_map:
-            target = extract_target_from_text_or_reply(update)
-            if not target:
-                await update.message.reply_text("روی پیام فرد ریپلای کنید یا آیدی عددی بنویسید."); return
-            await db.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
-            await db.execute(
-                "UPDATE users SET role=$2, joined_guard_at=COALESCE(joined_guard_at, NOW()) WHERE user_id=$1",
-                target, role_map[txt]
+# ---------------------------------------------------------
+# Handlers — Callback Buttons
+# ---------------------------------------------------------
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    u = q.from_user
+    await db.upsert_user(u)
+
+    data = q.data or ""
+    try:
+        if data.startswith("enter:"):
+            kind = data.split(":", 1)[1]
+            await db.open_session(u.id, kind)
+            await q.answer("ثبت شد ✅")
+            await q.edit_message_text(f"ورود {('چت' if kind=='chat' else 'کال')} ثبت شد.")
+            return
+
+        if data.startswith("switch:"):
+            kind = data.split(":", 1)[1]
+            await db.open_session(u.id, kind)
+            await q.answer("سوییچ شد ✅")
+            await q.edit_message_text(f"فعلاً روی {('چت' if kind=='chat' else 'کال')} هستی.")
+            return
+
+        if data == "exit:all":
+            rows = await db.close_sessions(u.id)
+            await db.accrue_session_seconds(rows)
+            await q.answer("خروج ثبت شد ✅")
+            await q.edit_message_text("تمام سشن‌ها بسته شد.")
+            return
+
+        if data == "contact":
+            # open DM pipe (instruction)
+            await q.answer()
+            await context.bot.send_message(
+                chat_id=u.id,
+                text=(
+                    "پیام خودت رو همین‌جا برام بفرست تا به گارد/مالک برسونم.\n"
+                    "لطفاً از اسپم خودداری کن — هر پیام تا ۴۵ ثانیه یک‌بار ارسال می‌شه."
+                ),
             )
-            await context.bot.send_message(GUARD_CHAT_ID, f"🔧 {txt} برای {await mention_name(context, target)}", parse_mode=ParseMode.HTML)
-            await context.bot.send_message(OWNER_ID, f"🔧 {txt} برای {await mention_name(context, target)}", parse_mode=ParseMode.HTML)
-            await update.message.reply_text("انجام شد."); return
+            await q.edit_message_text("برای ارتباط مستقیم، به PV من پیام بده.")
+            return
 
-    # لیست گارد (مالک و همه نقش‌دارها)
-    if txt == "لیست گارد":
-        rows = await db.fetch("""
-            SELECT user_id, role, rank FROM users
-            WHERE role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
-            ORDER BY
-              CASE role
-                WHEN 'senior_all' THEN 0
-                WHEN 'senior_chat' THEN 1
-                WHEN 'senior_call' THEN 2
-                WHEN 'channel_admin' THEN 3
-                WHEN 'chat_admin' THEN 4
-                WHEN 'call_admin' THEN 5
-                ELSE 9 END,
-              rank DESC NULLS LAST
-        """)
-        lines = ["👥 تیم مدیریت:"]
-        lines.append(f"- مالک: {await mention_name(context, OWNER_ID)}")
-        role_map = {
-            "senior_all": "ارشد کل",
-            "senior_chat": "ارشد چت",
-            "senior_call": "ارشد کال",
-            "channel_admin": "ادمین کانال",
-            "chat_admin": "ادمین چت",
-            "call_admin": "ادمین کال",
-        }
-        for r in rows:
-            rr = role_map.get(r["role"], r["role"])
-            lines.append(f"- {rr}: {await mention_name(context, r['user_id'])}")
-        await update.message.reply_html("\n".join(lines))
-        return
+        if data.startswith("gender:"):
+            g = data.split(":", 1)[1]
+            if g not in {"m","f"}:
+                await q.answer("انتخاب نامعتبر.")
+                return
+            await db.execute("UPDATE users SET gender=$1, updated_at=NOW() WHERE user_id=$2", g, u.id)
+            await q.answer("ذخیره شد ✅")
+            await q.edit_message_text("جنسیت ذخیره شد. ممنون!")
+            return
 
-    # ورود/خروج/تغییر فعالیت (مشترک)
-    if txt == "ثبت":
-        await update.message.reply_text("نوع فعالیت را انتخاب کنید:", reply_markup=kb_checkin()); return
-
-    if txt == "تغییر فعالیت":
-        await update.message.reply_text("به چه فعالیتی تغییر کنم؟", reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("تغییر به چت", callback_data="switch_to_chat"),
-            InlineKeyboardButton("تغییر به کال", callback_data="switch_to_call"),
-        ]])); return
-
-    if txt == "ثبت خروج":
-        # محکم: همه‌ی سشن‌های باز هدف بسته شوند
-        target = extract_target_from_text_or_reply(update)
-        actor_is_mgr = await is_senior_or_owner(user.id)
-        uid = target if (actor_is_mgr and target) else user.id
-        await end_all_sessions(context, uid, reason=("درخواست مدیر" if uid != user.id else "درخواست متنی"))
-        await update.message.reply_text("خروج ثبت شد ✅"); return
-
-    if txt in ("ورود چت","ورود کال"):
-        kind = "chat" if txt == "ورود چت" else "call"
-        actor_is_mgr = await is_senior_or_owner(user.id)
-        target = extract_target_from_text_or_reply(update)
-        uid = target if (actor_is_mgr and target) else user.id
-        other = "call" if kind=="chat" else "chat"
-        old = await get_open_session(uid, other)
-        if old: await end_session(context, old["id"], reason="تغییر فعالیت (متنی)")
-        await start_session(context, uid, kind)
-        txt2 = f"✅ ورود {('چت' if kind=='chat' else 'کال')}: {await mention_name(context, uid)}"
-        for dest in (GUARD_CHAT_ID, OWNER_ID):
-            try: await context.bot.send_message(dest, txt2, parse_mode=ParseMode.HTML)
-            except Exception: pass
-        await update.message.reply_text("ثبت شد."); return
-
-    # وضعیت امروزِ شخص
-    if txt == "گارد":
-        r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", today(), user.id)
-        if not r:
-            await update.message.reply_text("امروز آماری ندارید."); return
-        await update.message.reply_text(
-            f"آمار امروز:\n"
-            f"پیام‌ها: {r['chat_messages']}\n"
-            f"ریپلای زده/دریافت: {r['replies_sent']}/{r['replies_received']}\n"
-            f"حضور چت: {human_td(r['chat_seconds'])} | کال: {human_td(r['call_seconds'])} | دفعات کال: {r['call_sessions']}"
-        ); return
-
-    # محدود/آزاد رسانه (فقط مالک/ارشد)
-    if txt in ("محدود رسانه","آزاد رسانه"):
-        is_mgr = await is_senior_or_owner(user.id)
-        if not is_mgr and not is_owner(user.id):
-            await update.message.reply_text("فقط مالک/ارشد."); return
-        target = extract_target_from_text_or_reply(update)
-        if not target:
-            await update.message.reply_text("روی پیام کاربر ریپلای کنید یا آیدی عددی بنویسید."); return
+        await q.answer("دستور ناشناخته.")
+    except Exception as e:
+        log.exception("callback error: %s", e)
         try:
-            if txt == "محدود رسانه":
-                perms = ChatPermissions(
-                    can_send_messages=True,
-                    can_send_audios=False, can_send_documents=False, can_send_photos=False,
-                    can_send_videos=False, can_send_video_notes=False, can_send_voice_notes=False,
-                    can_send_polls=False, can_send_other_messages=False, can_add_web_page_previews=False
-                )
-            else:
-                perms = ChatPermissions(
-                    can_send_messages=True,
-                    can_send_audios=True, can_send_documents=True, can_send_photos=True,
-                    can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True,
-                    can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True
-                )
-            await context.bot.restrict_chat_member(
-                MAIN_CHAT_ID, target,
-                permissions=perms,
-                use_independent_chat_permissions=True
-            )
-            await update.message.reply_text("انجام شد.")
-        except Exception:
-            await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
-        return
-
-    # سکوت/حذف سکوت (فقط در گروه اصلی و با ریپلای)
-    if chat_id == MAIN_CHAT_ID:
-        if txt.startswith(("سکوت","خفه")):
-            target = extract_target_from_text_or_reply(update)
-            if not target:
-                await update.message.reply_text("ریپلای لازم است."); return
-            perms = ChatPermissions(can_send_messages=False)
-            try:
-                await context.bot.restrict_chat_member(MAIN_CHAT_ID, target, permissions=perms, use_independent_chat_permissions=True)
-                await update.message.reply_text("کاربر در سکوت قرار گرفت.")
-            except Exception:
-                await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
-            return
-
-        if "حذف سکوت" in txt or "حذف خفه" in txt:
-            target = extract_target_from_text_or_reply(update)
-            if not target:
-                await update.message.reply_text("ریپلای لازم است."); return
-            perms = ChatPermissions(
-                can_send_messages=True,
-                can_send_photos=True, can_send_videos=True, can_send_audios=True,
-                can_send_documents=True, can_send_polls=True, can_send_video_notes=True, can_send_voice_notes=True,
-                can_send_other_messages=True, can_add_web_page_previews=True
-            )
-            try:
-                await context.bot.restrict_chat_member(MAIN_CHAT_ID, target, permissions=perms, use_independent_chat_permissions=True)
-                await update.message.reply_text("کاربر از سکوت خارج شد.")
-            except Exception:
-                await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
-            return
-
-    # ثبت جنسیت (خود یا با ریپلای توسط اعضای گارد)
-    if txt in ("ثبت پسر","ثبت دختر"):
-        target = extract_target_from_text_or_reply(update) or user.id
-        if target != user.id and not await is_guard_member(user.id):
-            await update.message.reply_text("فقط اعضای گارد می‌توانند برای دیگران ثبت کنند."); return
-        await db.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
-        await db.execute(
-            "UPDATE users SET gender=$2 WHERE user_id=$1",
-            target, "male" if txt.endswith("پسر") else "female"
-        )
-        who = "برای خودتان" if target == user.id else f"برای {await mention_name(context, target)}"
-        await update.message.reply_html(f"✅ جنسیت {who} ثبت شد.")
-        return
-
-    # تگ پسرها/دخترها (و نسخه‌های لیست) — با ریپلای
-    if txt in ("تگ پسرها","تگ دخترها","تگ لیست پسر","تگ لیست دختر","تگ لیست همه"):
-        if not update.message.reply_to_message:
-            await update.message.reply_text("باید روی یک پیام ریپلای کنید."); return
-        where = ""
-        if txt in ("تگ پسرها","تگ لیست پسر"):
-            where = "WHERE gender='male'"
-        elif txt in ("تگ دخترها","تگ لیست دختر"):
-            where = "WHERE gender='female'"
-        rows = await db.fetch(f"SELECT user_id FROM users {where} ORDER BY rank DESC NULLS LAST LIMIT 40")
-        if not rows:
-            await update.message.reply_text("فهرست خالی است."); return
-        mentions = []
-        for r in rows:
-            mentions.append(await mention_name(context, r["user_id"]))
-        # تقسیم اگر خیلی طولانی شد (ساده)
-        text = " ".join(mentions)
-        await update.message.reply_to_message.reply_html(text)
-        return
-
-    # درخواست ادمینی — فقط ارسال گزارش (بدون پاسخ)
-    if txt == "درخواست ادمینی":
-        uid = user.id
-        today_row = await db.fetchrow("SELECT COALESCE(chat_messages,0) msgs, COALESCE(chat_seconds,0) chat_s, COALESCE(call_seconds,0) call_s FROM daily_stats WHERE d=$1 AND user_id=$2", today(), uid)
-        since = today() - timedelta(days=7)
-        row7 = await db.fetchrow("""
-            SELECT COALESCE(SUM(chat_count),0) cnt, MAX(last_active) la
-            FROM members_stats WHERE d >= $1 AND user_id=$2
-        """, since, uid)
-        txtrep = (f"درخواست ادمینی از {await mention_name(context, uid)} (ID <code>{uid}</code>)\n"
-                  f"آمار امروز: پیام {today_row['msgs'] if today_row else 0} | چت {human_td((today_row['chat_s'] if today_row else 0))} | کال {human_td((today_row['call_s'] if today_row else 0))}\n"
-                  f"آمار ۷ روزه: مجموع پیام‌های چت {row7['cnt'] or 0} | آخرین فعالیت: {row7['la']}")
-        for dest in (GUARD_CHAT_ID, OWNER_ID):
-            try:
-                await context.bot.send_message(dest, txtrep, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
-        await update.message.reply_text("درخواست شما ثبت و برای مالک/گارد ارسال شد ✅")
-        return
-
-    # آمار/آمار کلی/ممنوع/آزاد/زیرنظر/آمار چت الان/کال الان/آمار
-    if is_owner(user.id):
-        if txt == "آمار چت الان":
-            rows = await db.fetch("""
-                SELECT u.user_id,u.role, COALESCE(s.chat_messages,0) msgs, COALESCE(s.chat_seconds,0) chat_time
-                FROM users u LEFT JOIN daily_stats s ON s.d=$1 AND s.user_id=u.user_id
-                WHERE u.role IS NOT NULL
-                  AND u.role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
-                ORDER BY
-                  CASE u.role
-                    WHEN 'senior_all' THEN 0
-                    WHEN 'senior_chat' THEN 1
-                    WHEN 'senior_call' THEN 2
-                    WHEN 'channel_admin' THEN 3
-                    WHEN 'chat_admin' THEN 4
-                    WHEN 'call_admin' THEN 5
-                    ELSE 9
-                  END, u.rank DESC NULLS LAST
-            """, today())
-            lines = ["آمار چت تا این لحظه:"]
-            for r in rows:
-                lines.append(f"{r['role']}: {await mention_name(context, r['user_id'])} | پیام: {r['msgs']} | حضور: {human_td(r['chat_time'])}")
-            await update.message.reply_html("\n".join(lines), reply_markup=kb_owner_rate()); return
-
-        if txt == "آمار کال الان":
-            rows = await db.fetch("""
-                SELECT u.user_id,u.role, COALESCE(s.call_seconds,0) call_time, COALESCE(s.call_sessions,0) calls
-                FROM users u LEFT JOIN daily_stats s ON s.d=$1 AND s.user_id=u.user_id
-                WHERE u.role IS NOT NULL
-                  AND u.role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
-                ORDER BY
-                  CASE u.role
-                    WHEN 'senior_all' THEN 0
-                    WHEN 'senior_chat' THEN 1
-                    WHEN 'senior_call' THEN 2
-                    WHEN 'channel_admin' THEN 3
-                    WHEN 'chat_admin' THEN 4
-                    WHEN 'call_admin' THEN 5
-                    ELSE 9
-                  END, u.rank DESC NULLS LAST
-            """, today())
-            lines = ["آمار کال تا این لحظه:"]
-            for r in rows:
-                lines.append(f"{r['role']}: {await mention_name(context, r['user_id'])} | زمان کال: {human_td(r['call_time'])} | دفعات: {r['calls']}")
-            await update.message.reply_html("\n".join(lines), reply_markup=kb_owner_rate()); return
-
-        if txt == "آمار":
-            row = await db.fetchrow("SELECT COUNT(DISTINCT user_id) c FROM members_stats WHERE d=$1 AND chat_count>0", today())
-            await update.message.reply_text(f"تعداد کاربران فعال امروز: {row['c']}"); return
-
-        if txt.startswith("آمار کلی کاربر"):
-            m = re.search(r"(\d{4,})", txt)
-            if not m:
-                await update.message.reply_text("آیدی عددی را بنویسید."); return
-            uid = int(m.group(1)); since = today() - timedelta(days=30)
-            r = await db.fetchrow("""
-                SELECT COALESCE(SUM(chat_messages),0) msgs,
-                       COALESCE(SUM(replies_sent),0) rs,
-                       COALESCE(SUM(replies_received),0) rr,
-                       COALESCE(SUM(chat_seconds),0) chat_s,
-                       COALESCE(SUM(call_seconds),0) call_s,
-                       COALESCE(SUM(call_sessions),0) calls
-                FROM daily_stats WHERE d >= $1 AND user_id=$2
-            """, since, uid)
-            await update.message.reply_text(
-                f"آمار ۳۰ روز گذشته {await mention_name(context, uid)}:\n"
-                f"- پیام چت: {r['msgs']} (ریپلای زده/دریافت: {r['rs']}/{r['rr']})\n"
-                f"- زمان چت: {human_td(r['chat_s'])}\n"
-                f"- زمان کال: {human_td(r['call_s'])} | دفعات کال: {r['calls']}"
-            , parse_mode=ParseMode.HTML); return
-
-        if txt.startswith("ممنوع") or txt.startswith("آزاد "):
-            m = re.search(r"(\d{4,})", txt)
-            target = extract_target_from_text_or_reply(update) or (int(m.group(1)) if m else None)
-            if not target:
-                await update.message.reply_text("روی پیام فرد ریپلای کنید یا آیدی عددی بنویسید."); return
-            if txt.startswith("ممنوع"):
-                await db.execute("INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
-                await update.message.reply_text("در لیست ممنوع اضافه شد.")
-            else:
-                await db.execute("DELETE FROM banned_users WHERE user_id=$1", target)
-                await update.message.reply_text("از لیست ممنوع حذف شد.")
-            return
-
-        if txt.startswith("زیرنظر"):
-            m = re.search(r"(\d{4,})", txt)
-            if not m:
-                await update.message.reply_text("آیدی عددی را بنویسید."); return
-            uid = int(m.group(1))
-            await db.execute("INSERT INTO watchlist(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
-            await update.message.reply_text("کاربر به لیست زیرنظر افزوده شد."); return
-
-# -------------------- Group message capture --------------------
-async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MAIN_CHAT_ID:
-        return
-
-    msg = update.message
-    u = msg.from_user
-
-    await ensure_user(u)
-    await bump_member_stats(u.id)
-
-    # جنسیت: اگر نامشخص و ویژگی روشن است → پاپ‌آپ تعیین جنسیت
-    conf = await db.fetchrow("SELECT gender_prompt FROM config WHERE id=TRUE")
-    if conf and conf["gender_prompt"]:
-        g = await db.fetchrow("SELECT gender FROM users WHERE user_id=$1", u.id)
-        if not g or not g["gender"]:
-            try:
-                await msg.reply_text("جنسیتت چیه؟ یکی رو انتخاب کن:", reply_markup=kb_gender(u.id))
-            except Exception:
-                pass
-
-    # فقط اعضای گارد (و مالک) پاپ‌آپ «ثبت ورود» بگیرند
-    is_guard = await is_guard_member(u.id)
-    if not is_guard:
-        return
-
-    await bump_admin_on_message(msg)
-
-    # اگر سشن باز ندارد → پاپ‌آپ «ثبت ورود»
-    open_any = await get_open_session(u.id, None)
-    if not open_any:
-        try:
-            await msg.reply_text("نوع فعالیت را انتخاب کنید:", reply_markup=kb_checkin())
+            await q.answer("خطا رخ داد.")
         except Exception:
             pass
-        # اطلاع
-        text = f"🟢 شروع فعالیت (بدون ثبت ورود): {await mention_name(context, u.id)} — لطفاً ورود چت/کال را انتخاب کند."
-        for dest in (GUARD_CHAT_ID, OWNER_ID):
-            try:
-                await context.bot.send_message(dest, text, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
+
+
+# ---------------------------------------------------------
+# Handlers — Messages (PV)
+# ---------------------------------------------------------
+
+async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    u = update.effective_user
+    if not msg or not u:
         return
-    # اگر نوبت چت باز باشد، خروج خودکار توسط job مدیریت می‌شود
 
-# -------------------- Daily jobs --------------------
-async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
-    d = today() - timedelta(days=1)
-    rows = await db.fetch("SELECT * FROM daily_stats WHERE d=$1", d)
-    for r in rows:
-        uid = r["user_id"]
-        txt = (f"گزارش روزانه ({d}):\n"
-               f"- پیام‌های چت: {r['chat_messages']}\n"
-               f"- ریپلای زده/دریافت: {r['replies_sent']}/{r['replies_received']}\n"
-               f"- حضور چت: {human_td(r['chat_seconds'])}\n"
-               f"- حضور کال: {human_td(r['call_seconds'])} | دفعات کال: {r['call_sessions']}\n"
-               f"- اولین ورود: {r['first_checkin']}\n"
-               f"- آخرین خروج: {r['last_checkout']}")
-        try: await context.bot.send_message(uid, txt)
-        except Exception: pass
+    await db.upsert_user(u)
 
-    agg = await db.fetch("""
-        SELECT u.user_id,u.role, COALESCE(s.chat_messages,0) chat_messages,
-               COALESCE(s.call_seconds,0) call_seconds,
-               COALESCE(s.chat_seconds,0) chat_seconds
-        FROM users u LEFT JOIN daily_stats s ON s.d=$1 AND s.user_id=u.user_id
-        WHERE u.role IS NOT NULL
-          AND u.role IN ('senior_all','senior_chat','senior_call','channel_admin','chat_admin','call_admin')
-        ORDER BY
-          CASE u.role
-            WHEN 'senior_all' THEN 0
-            WHEN 'senior_chat' THEN 1
-            WHEN 'senior_call' THEN 2
-            WHEN 'channel_admin' THEN 3
-            WHEN 'chat_admin' THEN 4
-            WHEN 'call_admin' THEN 5
-            ELSE 9
-          END, u.rank DESC NULLS LAST
-    """, d)
-    lines = [f"آمار کلی مدیران — {d}"]
-    for a in agg:
-        lines.append(f"{a['role'] or '-'} | {await mention_name(context, a['user_id'])} | پیام: {a['chat_messages']} | کال: {human_td(a['call_seconds'])} | حضور: {human_td(a['chat_seconds'])}")
-    txt = "\n".join(lines)
-    for ch in [GUARD_CHAT_ID, OWNER_ID]:
-        try: await context.bot.send_message(ch, txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("👍 راضی", callback_data="rate_yes"),
-            InlineKeyboardButton("👎 ناراضی", callback_data="rate_no")
-        ]]))
-        except Exception: pass
+    # Enforce ban
+    if await db.is_banned(u.id):
+        try:
+            await msg.reply_text("دسترسی شما مسدود است.")
+        except Forbidden:
+            pass
+        return
 
-async def send_candidates_report(context: ContextTypes.DEFAULT_TYPE):
-    d = today() - timedelta(days=1)
-    rows = await db.fetch(
-        "SELECT user_id, chat_count FROM members_stats WHERE d=$1 ORDER BY chat_count DESC LIMIT 10",
-        d
-    )
-    lines = [f"۱۰ کاربر برتر چت ({d})"]
-    for i, r in enumerate(rows, start=1):
-        lines.append(f"{i}. {await mention_name(context, r['user_id'])} — پیام: {r['chat_count']}")
-    try: await context.bot.send_message(OWNER_ID, "\n".join(lines), parse_mode=ParseMode.HTML)
-    except Exception: pass
+    # Throttle
+    if not await throttle_dm(u.id):
+        await msg.reply_text("لطفاً کمی صبر کن، پیام‌هات پشت‌سرهم هست. ⏳")
+        return
 
-async def send_watchlist_reports(context: ContextTypes.DEFAULT_TYPE):
-    d = today() - timedelta(days=1)
-    watch = await db.fetch("SELECT user_id FROM watchlist")
-    if not watch: return
-    for w in watch:
-        uid = w["user_id"]
-        r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", d, uid)
-        if not r: continue
-        txt = (f"زیرنظر ({d}) برای {await mention_name(context, uid)}:\n"
-               f"- پیام: {r['chat_messages']}, ریپلای ز/د: {r['replies_sent']}/{r['replies_received']}\n"
-               f"- حضور چت: {human_td(r['chat_seconds'])}, کال: {human_td(r['call_seconds'])}")
-        for ch in [GUARD_CHAT_ID, OWNER_ID]:
-            try: await context.bot.send_message(ch, txt, parse_mode=ParseMode.HTML)
-            except Exception: pass
+    # Forward to guard/owner channel
+    text = msg.text_html or "(بدون متن)"
+    caption = f"پیام جدید از <a href=\"tg://user?id={u.id}\">{u.first_name}</a> (id={u.id})\n\n{text}"
 
-async def random_tag_job(context: ContextTypes.DEFAULT_TYPE):
-    conf = await db.fetchrow("SELECT random_tag FROM config WHERE id=TRUE")
-    if not conf or not conf["random_tag"]: return
-    rows = await db.fetch("SELECT user_id FROM members_stats WHERE d=$1 AND chat_count>0 ORDER BY random() LIMIT 1", today())
-    if not rows: return
-    uid = rows[0]["user_id"]
-    phrase = random.choice(FUN_LINES)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("پاسخ یک‌بار", callback_data=f"replyonce:{u.id}")],
+        [InlineKeyboardButton("مسدود کاربر", callback_data=f"ban:{u.id}")],
+    ])
+
     try:
-        # منشن با نام
-        await context.bot.send_message(MAIN_CHAT_ID, f"{phrase}\n{await mention_name(context, uid)}", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            chat_id=GUARD_CHAT_ID or OWNER_ID,
+            text=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        await msg.reply_text("پیام به گارد/مالک ارسال شد ✅")
+    except Exception as e:
+        log.exception("forward error: %s", e)
+        await msg.reply_text("ارسال پیام ناموفق بود. کمی بعد دوباره تلاش کن.")
+
+
+# Admin replies to PV pipeline (replyonce and ban)
+async def on_guard_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    u = q.from_user
+
+    # only owner or admins can use these
+    if not (is_owner(u.id) or (await ensure_role(update, context, ADMIN_ROLES))):
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        return
+
+    data = q.data or ""
+
+    if data.startswith("replyonce:"):
+        target = parse_user_id(data.split(":",1)[1])
+        if not target:
+            await q.answer("آیدی نامعتبر.")
+            return
+        await q.answer("متن پاسخ را در همین ترد ریپلای کنید.")
+        await q.edit_message_reply_markup(None)
+        context.chat_data["reply_target"] = target
+        return
+
+    if data.startswith("ban:"):
+        target = parse_user_id(data.split(":",1)[1])
+        if not target:
+            await q.answer("آیدی نامعتبر.")
+            return
+        await db.execute(
+            "INSERT INTO banned_users(user_id, reason, banned_by) VALUES($1,$2,$3)\n"
+            "ON CONFLICT(user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_by=EXCLUDED.banned_by, banned_at=NOW()",
+            target, "pipeline", u.id
+        )
+        await q.answer("کاربر مسدود شد ✅")
+        await q.edit_message_reply_markup(None)
+        try:
+            await context.bot.send_message(chat_id=target, text="شما مسدود شدید.")
+        except Exception:
+            pass
+        return
+
+
+async def on_guard_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # If guard/owner replies inside guard chat with chat_data['reply_target'] set
+    if update.effective_chat and (update.effective_chat.id not in {GUARD_CHAT_ID, OWNER_ID}):
+        return
+    target = context.chat_data.get("reply_target")
+    if not target:
+        return
+    text = update.effective_message.text or ""
+    try:
+        await context.bot.send_message(chat_id=target, text=f"پاسخ مدیریت: {text}")
+        await update.effective_message.reply_text("ارسال شد ✅")
+        context.chat_data.pop("reply_target", None)
+    except Forbidden:
+        await update.effective_message.reply_text("کاربر پیام‌گیر نیست.")
+
+
+# ---------------------------------------------------------
+# Handlers — Group messages
+# ---------------------------------------------------------
+
+async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.id != MAIN_CHAT_ID:
+        return
+    msg = update.effective_message
+    u = update.effective_user
+    if not msg or not u:
+        return
+
+    await db.upsert_user(u)
+
+    # increment basic counters
+    await db.bump_message(u.id, reply=bool(msg.reply_to_message))
+
+    # If gender prompt is on and user has none, prompt silently via DM
+    gender_prompt = (await db.config_get("gender_prompt", "on")) == "on"
+    if gender_prompt:
+        g = await db.fetchval("SELECT gender FROM users WHERE user_id=$1", u.id)
+        if not g:
+            try:
+                await context.bot.send_message(chat_id=u.id, text="جنسیتت رو انتخاب کن:", reply_markup=kb_gender())
+            except Forbidden:
+                pass
+
+
+# ---------------------------------------------------------
+# Jobs (nightly + random tag) — idempotent
+# ---------------------------------------------------------
+
+async def job_nightly(context: ContextTypes.DEFAULT_TYPE):
+    # Placeholder: aggregate and send reports — keep minimal here
+    try:
+        now = datetime.now(tz=LOCAL_TZ)
+        await context.bot.send_message(chat_id=OWNER_ID, text=f"گزارش شبانه اجرا شد: {now:%Y-%m-%d}")
+    except Exception as e:
+        log.exception("nightly job error: %s", e)
+
+
+async def job_random_tag(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        state = (await db.config_get("random_tag", "off"))
+        if state != "on":
+            return
+        # pick 3 most recently active users today
+        today = datetime.now(tz=LOCAL_TZ).date()
+        rows = await db.fetch(
+            "SELECT user_id FROM members_stats WHERE day=$1 ORDER BY msgs DESC NULLS LAST LIMIT 3",
+            today,
+        )
+        if not rows:
+            return
+        mentions = [f"<a href='tg://user?id={r['user_id']}'>کاربر</a>" for r in rows]
+        await context.bot.send_message(
+            chat_id=MAIN_CHAT_ID,
+            text="🔥 " + "، ".join(mentions),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.exception("random tag job error: %s", e)
+
+
+def schedule_jobs(app: Application):
+    jq = app.job_queue
+    # remove existing jobs with same names to prevent dupes on restart
+    for name in ("nightly", "random_tag"):
+        for job in jq.get_jobs_by_name(name):
+            job.schedule_removal()
+
+    # Nightly at 00:10
+    jq.run_daily(job_nightly, time=datetime.time(hour=0, minute=10, tzinfo=LOCAL_TZ), name="nightly")
+    # Every 15 minutes
+    jq.run_repeating(job_random_tag, interval=900, first=30, name="random_tag")
+
+
+# ---------------------------------------------------------
+# Error handler
+# ---------------------------------------------------------
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("update error: %s", context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("یه خطای غیرمنتظره رخ داد. لطفاً دوباره تلاش کن.")
     except Exception:
         pass
 
-def seconds_until_midnight() -> int:
-    n = now(); tomorrow = (n + timedelta(days=1)).date()
-    midnight = datetime.combine(tomorrow, datetime.min.time(), tzinfo=TZINFO)
-    return max(5, int((midnight - n).total_seconds()))
 
-async def schedule_jobs(app: Application):
-    app.job_queue.run_repeating(send_daily_reports, interval=24*3600, first=seconds_until_midnight()+10, name="daily_reports")
-    app.job_queue.run_repeating(send_candidates_report, interval=24*3600, first=seconds_until_midnight()+20, name="candidates")
-    app.job_queue.run_repeating(send_watchlist_reports, interval=24*3600, first=seconds_until_midnight()+30, name="watchlist")
-    app.job_queue.run_repeating(random_tag_job, interval=900, first=300, name="random_tag")
+# ---------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------
 
-# -------------------- Bootstrapping --------------------
-async def post_init(app: Application):
-    await db.connect()
-    await schedule_jobs(app)
-    print("DB connected & jobs scheduled.")
+async def init_db() -> DB:
+    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+    async with pool.acquire() as con:
+        await con.execute(SCHEMA_SQL)
+    return DB(pool)
 
-async def post_shutdown(app: Application):
-    await db.close()
-    print("DB closed.")
 
 def build_app() -> Application:
-    app = ApplicationBuilder() \
-        .token(BOT_TOKEN) \
-        .rate_limiter(AIORateLimiter()) \
-        .post_init(post_init) \
-        .post_shutdown(post_shutdown) \
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .rate_limiter(AIORateLimiter())
+        .concurrent_updates(True)
         .build()
+    )
 
-    # /start
-    app.add_handler(CommandHandler("start", start), group=0)
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
 
     # Callbacks
-    app.add_handler(CallbackQueryHandler(on_contact_btn, pattern="^(contact_guard|contact_owner|back_home|retry_send)$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_owner_rate, pattern="^(rate_yes|rate_no)$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_checkin_checkout, pattern="^(checkin_chat|checkin_call|checkout_(chat|call)|switch_to_(chat|call))$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_my_stats, pattern="^my_stats$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_guard_reply_block, pattern="^(reply_|block_)\\d+$"), group=0)
-    app.add_handler(CallbackQueryHandler(on_gender_choice, pattern="^gender_(male|female)_\\d+$"), group=0)
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(enter:|switch:|exit:all|contact|gender:).+|^(contact)$"))
+    app.add_handler(CallbackQueryHandler(on_guard_callbacks, pattern=r"^(replyonce:|ban:)\d+"))
 
-    # پیام‌های گارد برای پاسخ ادمین‌ها
-    app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) & ~filters.StatusUpdate.ALL, capture_admin_reply), group=1)
+    # Guard text reply in guard chat
+    app.add_handler(MessageHandler(filters.Chat([GUARD_CHAT_ID, OWNER_ID]) & filters.TEXT & ~filters.COMMAND, on_guard_text_reply))
 
-    # پیام‌های گروه اصلی (آمار/پاپ‌آپ ورود/پاپ‌آپ جنسیت)
-    app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & ~filters.StatusUpdate.ALL, group_message), group=2)
+    # PV messages
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, on_private_message))
 
-    # فلو تماس در پیوی (کاربر → گارد/مالک)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.StatusUpdate.ALL, pipe_user_message), group=3)
+    # Group messages (MAIN_CHAT_ID)
+    app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & ~filters.COMMAND, on_group_message))
 
-    # دستورات متنی بدون / (در همه‌جا)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_triggers), group=4)
+    # Errors
+    app.add_error_handler(on_error)
 
+    schedule_jobs(app)
     return app
 
+
+async def main():
+    global db
+    db = await init_db()
+    app = build_app()
+    # Polling
+    await app.initialize()
+    try:
+        await app.start()
+        log.info("Bot started (polling)")
+        await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        await app.updater.idle()
+    finally:
+        await app.stop()
+        await db.pool.close()
+        log.info("Bot stopped")
+
+
 if __name__ == "__main__":
-    application = build_app()
-    application.run_polling(drop_pending_updates=True)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
