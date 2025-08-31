@@ -1,6 +1,6 @@
-# Souls Security Bot — Single-file (Railway + PostgreSQL)
+# main.py — Souls Security Bot (Railway + PostgreSQL)
 # PTB v20.x (async)
-# ENV: BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ(Asia/Tehran)
+# ENV: BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ=Asia/Tehran
 
 import os
 import re
@@ -66,6 +66,12 @@ def mention_html(user):
 
 def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
+
+async def try_clear_kb(message):
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 # -------------------- SQL Schema --------------------
 SCHEMA_SQL = """
@@ -141,184 +147,120 @@ CREATE TABLE IF NOT EXISTS contact_threads (
     last_forwarded_msg BIGINT,
     last_forwarded_chat BIGINT
 );
+
+CREATE TABLE IF NOT EXISTS admin_requests (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status TEXT NOT NULL DEFAULT 'open'  -- open/answered/rejected
+);
 """
 
+# -------------------- Fun lines for random tag --------------------
 FUN_LINES = [
-    "خفه شدی یا می‌خوای بمیری؟ 😂",
-    "پاشو بیکار، ملت خوابشون گرفت 😴",
-    "چقد فسیل‌بازی در میاری؟ 🦖",
-    "باز قهر کردی یا شارژ تموم شد؟ 📵",
-    "یه کلمه بگو، ببینیم زنده‌ای یا نه 😏",
-    "اه اه، بازم ننه‌بازی درآوردی 😒",
-    "کم بخور دیگه، ترکیدی خو 🐷",
-    "پاشو بجنب تنبل خان 🐌",
-    "خفن شدی فکر کردی کسی نمی‌بینه؟ 👀",
-    "باز تویی؟ خدا به خیر کنه 🤦",
-    "باز ولمون کن، نت ضعیفتو جمع کن 📶",
-    "یکی این یارو رو بیدار کن 😡",
-    "پسرر، چرا اینقدر لَختی؟ 🐢",
-    "حوصلمون سر رفت، یه چیزی بگو 😤",
-    "باز مشغول کُپیدی یا چایی خوردن؟ ☕",
-    "خفه خون گرفتی یا قورتت دادن؟ 😜",
-    "بسه ادا در نیار دیگه 🤡",
-    "باز لال شدی؟ 😑",
-    "چقد ژست گرفتی، دِ حرف بزن 😏",
-    "ای بابا، یکی اینو راه بندازه 😅",
-    "با این سکوتت دیگه همه فرار کردن 😬",
-    "باز گوشی رو بردی دستشویی؟ 🚽📱",
-    "هی تو! بیدار شووو 😆",
-    "یه تکونی بخور، زنگ زده شدی 🤖",
-    "چقد می‌خوای ناز کنی؟ 🙄",
-    "باز خوابیدی؟ هیولا 🛌",
-    "خفه خون گرفتی چرا؟ 🤔",
-    "اه اه، شُل کن دیگه 😝",
-    "مگه تو مردی؟ یه چیزی بگو 😂",
-    "باز سایلنتی؟ 🤫",
-    "چقد بی‌حالی، پاشو یه چیزی بگو 🥱",
-    "باز سرت تو یخچاله؟ 🍕",
-    "آقا ما رو مسخره کردی؟ 😒",
-    "بی‌خیال ژست، یه کلمه بگو 😎",
-    "چقد نوبی، یه حرکتی بزن 🤓",
-    "باز با ننه‌ت چت می‌کنی؟ 👩",
-    "پاشو بجنب، اینجا خوابگاه نیست 🛏️",
-    "چه مرگته لال شدی؟ 😆",
-    "یه صدایی از خودت در بیار 😏",
-    "خفن شدی باز، اه 🙃",
-    "چقد لفتش میدی؟ 😩",
-    "باز لج کردی؟ 😠",
-    "مردم از خنده، تو هنوز لالی 🤐",
-    "باز فیلم هندیه بازی می‌کنی؟ 🎬",
-    "عاشق شدی یا نتمون تموم شد؟ 💔",
-    "حیف نون، یه چیزی بگو 😂",
-    "بابا پاشو، همه دارن می‌میرن از حوصله 🥴",
-    "باز رفتی تو غار؟ 🦇",
-    "یخ زدی یا فقط مغزت هنگ کرده؟ 🥶",
-    "چقد گیجی آخه 🤦",
-    "باز بخواب تا فردا 😴",
-    "ملت خسته شدن از سکوتت 😤",
-    "چقد جوگیری تو 🤪",
-    "اه اه، گیر سه پیچ دادی؟ 🔧",
-    "مگه سوپر استاری؟ چرا لال شدی؟ 🤨",
-    "خواب‌الو، بیدار شو 😵",
-    "یادت رفته حرف بزنی؟ 🧠",
-    "بسه دیگه خفه خون 🤬",
-    "یارو مثل مجسمه نشسته 😑",
-    "بابا یکی اینو روشن کن 🔋",
-    "باز فیلم ترکی زدی؟ 📺",
-    "چه مرگته لامصب؟ 😂",
-    "باز تویی؟ 😐",
-    "هی، گوزو بیدار شو 😆",
-    "باز ول معطلی؟ 😏",
-    "گلابی، یه چیزی بگو 🍐",
-    "خفن فکر کردی دیگه؟ 🙃",
-    "باز توهم زدی؟ 😅",
-    "خفه خون گرفتی یا بی‌خیالی؟ 😒",
-    "باز خواب سنگین گرفتی؟ 🛌",
-    "خواب زمستونی داری؟ 🐻",
-    "چقد هلو هولی 🤦",
-    "یکی این سایلنتو ول کن 😤",
-    "خفه خون گرفتی چرا؟ 🤔",
-    "چقد شل و وارفته‌ای 🤢",
-    "بسه دیگه ژست روشنفکری 🤓",
-    "اه اه، گیر کردی باز 😡",
-    "پاشو تنبل! 🤬",
-    "باز قیافه می‌گیری؟ 😏",
-    "یارو فکر کرده شاهزاده‌ست 👑",
-    "خفه شو یه چیزی بگو 😂",
-    "اه اه، باز تو شروع کردی 😩",
-    "ای بابا چه مرگته؟ 😒",
-    "یارو از کما برگشته؟ 🛌",
-    "باز لال شدی چرا؟ 🤐",
-    "خفن بازی در نیار 🙄",
-    "چقد منگ و گیج 🤪",
-    "ای ول داش، یه چیزی بگو 😎",
-    "اه اه، حوصله نداریم دیگه 😤",
-    "یارو تو مریخ زندگی می‌کنه؟ 🚀",
-    "خفه خون گرفتی چرا؟ 🤔",
-    "باز این یارو 😬",
-    "حیف نون، یه کلمه بگو 😂",
-    "یاد بگیر یه ذره حرف بزنی 🤦",
-    "باز نت‌ات داغونه؟ 📶",
-    "چقد مسخره‌ای 😆",
-    "ای بابا، ملت خسته شدن 🤯",
-    "باز هیچی نمی‌گی؟ 😑",
-    "یکی این یارو رو بیدار کن 😡",
-    "چقد لفت میدی 😤",
-    "یخ زدی یا خوابیدی؟ 🥶",
-    "خفه خون گرفتی چرا؟ 🤔",
-    "باز کُپ کردی؟ 💤",
-    "چقد گیج و منگ 🤪",
-    "بسه ادا، دِ حرف بزن 😏",
-    "ملت کلافه شدن ازت 😡",
-    "باز بی‌خیال شدی؟ 😬",
-    "خفه خون گرفتی چرا؟ 🤐",
-    "باز سایلنتی؟ 😑",
-    "یارو ترکیده از سکوت 🤯",
-    "اه اه، چه قدر لوس 🤢",
-    "باز ننه‌ات صدات زده؟ 👩",
-    "یارو مغزش هنگ کرده 🤖",
-    "پاشو دیگه تمساح 😆",
-    "باز فیلم بازی درآوردی؟ 🎬",
-    "حیف نون، زنده‌ای؟ 😂",
-    "باز ول‌معطلی 😒",
-    "خفه خون گرفتی چرا؟ 😶",
-    "یکی اینو بندازه بیرون 🤬",
-    "ای بابا، تموم کن این ادا رو 😑",
-    "پاشو بجنب لنگه‌کفش 🥿",
-    "باز تو وسط معرکه‌ای؟ 😂",
-    "خفه شو، یه کلمه بگو 😆",
-    "چقد بی‌نمکی 😬",
-    "باز لال شدی چرا؟ 😐",
-    "ای بابا حوصلمون سر رفت 😤",
-    "یارو فکر کرده دانشمنده 🤓",
-    "باز ادا در میاره 😒",
-    "خفه خون گرفتی چرا؟ 😶",
-    "یارو شده آدم یخ زده 🥶",
-    "چقد کُند و لفتی 🤦",
-    "بسه دیگه ساکت بودن 😠",
-    "باز تو چت خراب می‌کنی؟ 😏",
-    "ای بابا چه داغونی 🤯",
-    "پاشو مردک 😆",
-    "خفن بازی در نیار 😂",
-    "باز تو وسط غوغایی؟ 🤪",
-    "یارو خیارشوره 🍆",
-    "چقد فسقلی بازی درمیاری 😑",
-    "خفه شو یه چیزی بگو 😅",
-    "اه اه، چه خسته‌کننده‌ای 🤢",
-    "یارو مغزش رفته تو مرخصی 🧠",
-    "باز تو داغون‌بازی درآوردی 🤦",
-    "بسه ادا اطوار 🤬",
-    "یارو خیال کرده سوپرمنه 🦸",
-    "خفه خون گرفتی چرا؟ 🤨",
-    "اه اه، ملت ترکیدن از سکوت 😤",
-    "باز تویی لعنتی 😂",
-    "پاشو بجنب هیولا 👹",
-    "چقد لفت میدی آخه 😡",
-    "خفن شدی؟ نه بابا 😏",
-    "باز فیلم تخیلی داری 🤯",
-    "یارو ترکید از بی‌حالی 🤣",
-    "بسه ادا، پاشو دیگه 🤬",
-    "اه اه، بازم این داغونا 😑",
-    "یارو قهر کرده انگار 😅",
-    "خفه خون گرفتی چرا؟ 😶",
-    "باز تو! آره با توام 🤨",
-    "چقد کسل و بی‌جون 🤦",
-    "بسه ادا اطوار، یه کلمه بگو 😤",
-    "یارو سکوت مرگ گرفته 🤐",
-    "اه اه، ملت کلافه شدن 😡",
-    "باز یخ کردی چرا؟ 🥶",
-    "خفه خون گرفتی یا باتری تموم شد؟ 🔋",
-    "یارو از دنیا بی‌خبره 😑",
-    "باز لال شدی چرا؟ 😂",
-    "چقد ضایع 🤣",
-    "ای بابا، حوصله نداریم دیگه 😤",
-    "باز کُپ کردی چرا؟ 😴",
-    "یارو از کار افتاده 🤖",
-    "بسه ادا دیگه 🤬",
-    "اه اه، باز این فسقلیا 🤢",
+    "یادت نره آب بخوری! 💧",
+    "امروزت پر از انرژی مثبت باشه ✨",
+    "یه لبخند کوچیک می‌تونه روزتو عوض کنه 🙂",
+    "همین الان یه نفس عمیق بکش 😌",
+    "یه استراحت کوتاه لازمه ☕️",
+    "بچه‌های سولز پشتتن 😉",
+    "امروز بهترین نسخه خودت باش 🌟",
+    "بهت افتخار می‌کنیم 👏",
+    "یه آهنگ خوب گوش بده 🎶",
+    "یه لیوان چای داغ می‌چسبه 🍵",
+    "کسی که زیاد می‌خنده همیشه برنده‌ست 😂",
+    "ذهن آروم = زندگی قشنگ 🧘",
+    "هیچ چیز به اندازه سلامتی مهم نیست 💪",
+    "یه کار خوب کوچیک انجام بده ❤️",
+    "یادت نره خوشحال باشی 😍",
+    "دنیارو با انرژی خوبت قشنگ‌تر کن 🌍",
+    "باور کن از پس همه‌چی برمیای 💯",
+    "هر روز یه شروع جدیده 🌅",
+    "یه قهوه خوب همه‌چی رو درست می‌کنه ☕️",
+    "امید هیچ‌وقت فراموش نشه 🌈",
+    "همیشه به جلو نگاه کن 🚀",
+    "با یه لبخند دنیا رو تغییر بده 😁",
+    "مهربون بودن همیشه قشنگه 💕",
+    "یادت نره ورزش سبک انجام بدی 🏃",
+    "هر چیزی درست میشه، فقط صبور باش ⏳",
+    "تو خاصی! 💎",
+    "شاد بودن انتخابه، انتخاب کن 😎",
+    "زندگی کوتاهه، ساده بگیر 🌼",
+    "تو می‌تونی، فقط ادامه بده 🔥",
+    "امروز می‌تونه شروع یه چیز بزرگ باشه 🚀",
+    "شاد بودن مسریه، پخش کن 😁",
+    "یه فنجون قهوه همیشه جواب میده ☕️",
+    "دنیا جای قشنگ‌تری میشه با تو 🌍",
+    "لبخند بزن، حتی وقتی سخت میشه 🌻",
+    "قدردان چیزای کوچیک باش 🙏",
+    "با انرژی مثبت جلو برو 🔆",
+    "تو قهرمانی، حتی تو چیزای کوچیک 🥊",
+    "یه لحظه بشین و لذت ببر 🌅",
+    "خاطره‌سازی بهترین کاره 📷",
+    "نفس عمیق = آرامش واقعی 🌬️",
+    "آرامش رو نفس بکش 😌",
+    "یکم به خودت جایزه بده 🎁",
+    "یک کتاب خوب شروع کن 📖",
+    "هیچ وقت دیر نیست شروع کنی ⏰",
+    "ساده زندگی کن 🌱",
+    "گاهی فقط باید بخوابی 😴",
+    "به لحظه‌ها اهمیت بده ⏳",
+    "باور داشته باش بهترین‌ها در راهن 🌈",
+    "خودت باش، بقیه همه تکراری‌ان 🤗",
+    "تو خیلی مهمی 💯",
+    "یاد بگیر از اشتباهات 💡",
+    "به آینده امیدوار باش 🔮",
+    "موفقیت با تلاش میاد 🛠️",
+    "آرام جلو برو 🌊",
+    "گاهی یه چرت کوتاه لازمه 😌",
+    "یه موزیک شاد پلی کن 🎧",
+    "همین الان یه پیام خوب به یه دوست بده 📩",
+    "خستگی یعنی تو تلاش کردی 👏",
+    "به دل خودت گوش کن 💓",
+    "شاد بودن رو به بقیه هم هدیه بده 🎁",
+    "هر روز یه فرصت جدیده 🪂",
+    "یادته چقدر قوی‌ای؟ 💪",
+    "باور کن همه‌چی درست میشه 🌞",
+    "خاطره‌های خوب بساز 📸",
+    "امیدتو از دست نده 💫",
+    "هر روز پر از لبخند 🌸",
+    "دنیا رو قشنگ‌تر ببین 🌈",
+    "ثابت‌قدم باش 💪",
+    "مهربانی یادت نره ❤️",
+    "یه لیوان آب خنک خیلی می‌چسبه 🥤",
+    "بهترین لحظه همینه ⏰",
+    "بعضی وقتا فقط باید ریلکس کرد 🌴",
+    "یاد بگیر عاشق خودت باشی 💖",
+    "دنیارو با لبخندت روشن کن 🌟",
+    "دلت شاد، روزت قشنگ 🌺",
+    "هوای خودتو داشته باش 🌤️",
+    "رویاهاتو دنبال کن 🌠",
+    "از چیزای ساده لذت ببر 🍀",
+    "یه قدم کوچیک، یه تغییر بزرگ 👣",
+    "با آرامش ادامه بده 🧘",
+    "موفقیت نزدیکه ⛳️",
+    "امروز، روز توئه ⭐️",
+    "لبخندتو حفظ کن 🙂",
+    "حس خوب پخش کن ✨",
+    "یه لیوان چای؟ 🍵",
+    "یه موسیقی آروم گوش بده 🎼",
+    "گوشی رو بذار کنار، نفس بکش 🍃",
+    "به خودت استراحت بده ⏸️",
+    "امروز رو قشنگ بساز 🧩",
+    "یه کار جدید امتحان کن 🧪",
+    "خودت رو با کسی مقایسه نکن 🚫",
+    "قدم به قدم جلو برو 👟",
+    "امید یعنی زندگی 🌞",
+    "همه چی درست میشه 💫",
+    "آرزو کن و حرکت کن 🌠",
+    "خودتو دوست داشته باش 💖",
+    "بیا بخندیم 😄",
+    "یه چرت کوچولو بزن 😴",
+    "یکم آب بخور 💧",
+    "یه حرکت قشنگ بزن 👏",
+    "به خودت افتخار کن 🥇",
+    "روز خوبی بساز 🌼",
 ]
-while len(FUN_LINES) < 100:
-    FUN_LINES.append(f"پیام فان شماره {len(FUN_LINES)+1}!")
 
 # -------------------- DB --------------------
 class DB:
@@ -381,6 +323,12 @@ def kb_switch():
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("تغییر به چت", callback_data="switch_to_chat"),
         InlineKeyboardButton("تغییر به کال", callback_data="switch_to_call"),
+    ]])
+
+def kb_app_reply(app_id: int, uid: int):
+    # فقط مالک باید جواب بدهد؛ کنترل در کال‌بک انجام می‌شود
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✍️ پاسخ مالک", callback_data=f"app_reply_{app_id}_{uid}")
     ]])
 
 HOME_KB = InlineKeyboardMarkup([
@@ -468,7 +416,7 @@ async def start_session(context: ContextTypes.DEFAULT_TYPE, uid: int, kind: str,
         today(), uid, now()
     )
     if kind == "chat":
-        await schedule_inactivity(context, rec["id"])  # 10-minute idle watcher
+        await schedule_inactivity(context, rec["id"])  # 5-minute idle watcher
     return rec["id"]
 
 async def end_session(context: ContextTypes.DEFAULT_TYPE, sess_id: int, reason="manual"):
@@ -507,6 +455,7 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, sess_id: int, reason="
         pass
 
 async def schedule_inactivity(context: ContextTypes.DEFAULT_TYPE, sess_id: int):
+    # job هر 60 ثانیه چک می‌کند اگر 5 دقیقه بی‌فعالی → خروج خودکار
     name = f"inact_{sess_id}"
     for j in context.job_queue.get_jobs_by_name(name):
         j.schedule_removal()
@@ -520,8 +469,8 @@ async def inactivity_job(context: ContextTypes.DEFAULT_TYPE):
         context.job.schedule_removal(); return
     if sess["kind"] != "chat":
         context.job.schedule_removal(); return
-    if now() - sess["last_activity_ts"].astimezone(TZINFO) >= timedelta(minutes=10):
-        await end_session(context, sid, reason="بدون فعالیت ۱۰ دقیقه")
+    if now() - sess["last_activity_ts"].astimezone(TZINFO) >= timedelta(minutes=5):
+        await end_session(context, sid, reason="بدون فعالیت ۵ دقیقه")
         context.job.schedule_removal()
 
 # -------------------- Handlers --------------------
@@ -531,16 +480,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(WELCOME_TEXT, reply_markup=HOME_KB)
 
 async def on_contact_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     if q.data in ("contact_guard","contact_owner"):
         channel = "guard" if q.data.endswith("guard") else "owner"
         context.user_data["contact_channel"] = channel
-        await q.message.edit_text(
+        # بستن کیبورد قبلی
+        await try_clear_kb(q.message)
+        await q.message.reply_text(
             f"پیام خود را برای {'گارد مدیران' if channel=='guard' else 'مالک'} ارسال کنید.\nمتن/عکس/ویس مجاز است.",
             reply_markup=kb_back_retry()
         )
     elif q.data == "back_home":
-        await q.message.edit_text(WELCOME_TEXT, reply_markup=HOME_KB)
+        await try_clear_kb(q.message)
+        await q.message.reply_text(WELCOME_TEXT, reply_markup=HOME_KB)
     elif q.data == "retry_send":
         await q.answer("پیام جدید بفرستید.", show_alert=True)
 
@@ -583,19 +536,15 @@ async def on_guard_reply_block(update: Update, context: ContextTypes.DEFAULT_TYP
         rec = await db.fetchrow("SELECT * FROM contact_threads WHERE id=$1", tid)
         if not rec:
             return
-        await db.execute(
-            "INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING",
-            rec["user_id"]
-        )
+        await db.execute("INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING", rec["user_id"])
+        await try_clear_kb(q.message)
         await q.message.reply_text("کاربر مسدود شد.")
         return
 
     if data.startswith("reply_"):
         tid = int(data.split("_", 1)[1])
-
-        # One-Shot: مجوز پاسخ فقط برای همین ادمین (و فقط یک پیام بعدی)
         context.user_data["one_shot_reply_tid"] = tid
-
+        await try_clear_kb(q.message)
         await q.message.reply_text(
             "پیام پاسخ خود را ارسال کنید.\n"
             "⚠️ فقط اولین پیام بعد از این کلیک فوروارد می‌شود. "
@@ -604,19 +553,15 @@ async def on_guard_reply_block(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
 async def capture_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # فقط اگر این ادمین دکمه «پاسخ» را زده باشد
     tid = context.user_data.pop("one_shot_reply_tid", None)
     if not tid:
-        return  # مجوز پاسخ فعال نیست
-
+        return
     rec = await db.fetchrow("SELECT * FROM contact_threads WHERE id=$1", tid)
     if not rec:
         await update.message.reply_text("ترد نامعتبر است. دوباره دکمه «پاسخ» را بزنید.")
         return
-
-    uid = rec["user_id"]  # مخاطب (کاربر)
+    uid = rec["user_id"]
     m = update.message
-
     try:
         if m.text:
             await context.bot.send_message(uid, f"پاسخ مدیریت:\n\n{m.text}")
@@ -632,8 +577,15 @@ async def capture_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_animation(uid, m.animation.file_id, caption="پاسخ مدیریت:")
         else:
             await context.bot.send_message(uid, "پاسخ مدیریت ارسال شد.")
-
         await m.reply_text("پاسخ ارسال شد ✅\nبرای پاسخ جدید، دوباره دکمه «پاسخ» را بزنید.")
+        # بازگرداندن کیبورد به پیام ترد
+        try:
+            await context.bot.edit_message_reply_markup(
+                rec["last_forwarded_chat"], rec["last_forwarded_msg"],
+                reply_markup=kb_reply_block(rec["id"])
+            )
+        except Exception:
+            pass
     except Exception:
         await m.reply_text("ارسال پاسخ ناموفق بود. دوباره تلاش کنید.")
 
@@ -650,16 +602,24 @@ async def on_owner_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.message.reply_text("ثبت شد.")
 
 async def on_checkin_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    u = q.from_user; await ensure_user(u)
+    q = update.callback_query
+    await q.answer()
+    u = q.from_user
+    await ensure_user(u)
+
+    # هر کلیک → کیبورد همین پیام حذف شود تا چندبار کلیک نشود
+    await try_clear_kb(q.message)
+
     if q.data == "checkin_chat":
         msg = await context.bot.send_message(GUARD_CHAT_ID, f"✅ ورود چت: {mention_html(u)}", parse_mode=ParseMode.HTML, reply_markup=kb_checkout("chat"))
         await start_session(context, u.id, "chat", msg_chat=msg.chat_id, msg_id=msg.message_id)
-        await q.message.reply_text("ورود چت ثبت شد.", reply_markup=kb_checkout("chat"))
+        await context.bot.send_message(OWNER_ID, f"✅ ورود چت: {mention_html(u)}", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(u.id, "ورود چت ثبت شد ✅", reply_markup=kb_checkout("chat"))
     elif q.data == "checkin_call":
         msg = await context.bot.send_message(GUARD_CHAT_ID, f"🎧 ورود کال: {mention_html(u)}", parse_mode=ParseMode.HTML, reply_markup=kb_checkout("call"))
         await start_session(context, u.id, "call", msg_chat=msg.chat_id, msg_id=msg.message_id)
-        await q.message.reply_text("ورود کال ثبت شد.", reply_markup=kb_checkout("call"))
+        await context.bot.send_message(OWNER_ID, f"🎧 ورود کال: {mention_html(u)}", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(u.id, "ورود کال ثبت شد ✅", reply_markup=kb_checkout("call"))
     elif q.data.startswith("checkout_"):
         kind = q.data.split("_",1)[1]
         sess = await get_open_session(u.id, kind)
@@ -673,10 +633,12 @@ async def on_checkin_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE
         if old: await end_session(context, old["id"], reason="تغییر فعالیت")
         msg = await context.bot.send_message(GUARD_CHAT_ID, f"🔁 تغییر فعالیت به {('چت' if target=='chat' else 'کال')}: {mention_html(u)}", parse_mode=ParseMode.HTML, reply_markup=kb_checkout(target))
         await start_session(context, u.id, target, msg_chat=msg.chat_id, msg_id=msg.message_id)
-        await q.message.reply_text("تغییر فعالیت ثبت شد.", reply_markup=kb_checkout(target))
+        await context.bot.send_message(OWNER_ID, f"🔁 تغییر فعالیت: {mention_html(u)} → {('چت' if target=='chat' else 'کال')}", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(u.id, "تغییر فعالیت ثبت شد ✅", reply_markup=kb_checkout(target))
 
 async def on_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     uid = q.from_user.id
     r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", today(), uid)
     if not r:
@@ -700,22 +662,18 @@ def extract_target_from_text_or_reply(update: Update):
     return int(m.group(1)) if m else None
 
 OWNER_HELP = (
-    "راهنمای مالک (دستورات بدون /):\n"
-    "• ح غ روشن / ح غ خاموش — ثبت خودکار ورود چت با اولین پیام\n"
-    "• تگ رندوم روشن / تگ رندوم خاموش — هر ۱۵ دقیقه یک منشن فان\n"
-    "• پینگ — بررسی سرعت پاسخ ربات\n"
-    "• ترفیع چت / عزل چت — روی ریپلای یا با آیدی\n"
-    "• ترفیع کال / عزل کال — روی ریپلای یا با آیدی\n"
-    "• ترفیع ارشدچت / عزل ارشدچت\n"
-    "• ترفیع ارشدکال / عزل ارشدکال\n"
-    "• ترفیع ارشدکل / عزل ارشدکل\n"
-    "• ترفیع کانال / عزل کانال\n"
+    "راهنمای مالک (بدون /):\n"
+    "• ح غ روشن / ح غ خاموش — خودکار: ورود چت با اولین پیام؛ خروج بعد ۵ دقیقه بی‌فعالی\n"
+    "• تگ رندوم روشن / خاموش — هر ۱۵ دقیقه یک منشن فان\n"
+    "• پینگ — سرعت پاسخ ربات\n"
+    "• ترفیع/عزل چت، کال، ارشدچت، ارشدکال، ارشدکل، کانال — روی ریپلای یا با آیدی\n"
     "• آمار چت الان / آمار کال الان — تا این لحظه\n"
     "• آمار — تعداد کاربران فعال امروز گروه اصلی\n"
-    "• آمار کلی کاربر <آیدی> — گزارش ۳۰ روز گذشته کاربر\n"
-    "• ممنوع <آیدی> — اضافه به لیست ممنوع (بن در ورود)\n"
-    "• آزاد <آیدی> — حذف از لیست ممنوع\n"
-    "• زیرنظر+<آیدی> — گزارش شبانهٔ ویژه به گارد و مالک\n"
+    "• آمار کلی کاربر <آیدی> — ۳۰ روز گذشته کاربر\n"
+    "• ممنوع <آیدی> / آزاد <آیدی>\n"
+    "• زیرنظر+<آیدی> — گزارش شبانهٔ ویژه\n"
+    "• محدود رسانه / آزاد رسانه — محدودیت فقط-متن برای کاربر (روی ریپلای یا با آیدی)\n"
+    "• درخواست ادمینی — (برای کاربر) ارسال گزارش ۷ روز و دکمهٔ پاسخ برای مالک\n"
 )
 
 async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -725,7 +683,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # ==== OWNER-ONLY (no slash) ====
+    # ==== OWNER-ONLY ====
     if is_owner(user.id):
         if txt == "راهنما":
             await update.message.reply_text(OWNER_HELP); return
@@ -832,7 +790,8 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.execute("INSERT INTO watchlist(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
             await update.message.reply_text("کاربر به لیست زیرنظر افزوده شد."); return
 
-    # ==== GENERIC (admins/owner) ====
+    # ==== مشترک (مالک/ارشد/ادمین) ====
+    # ثبت/تغییر/خروج
     if txt == "ثبت":
         await update.message.reply_text("نوع فعالیت را انتخاب کنید:", reply_markup=kb_checkin()); return
 
@@ -855,6 +814,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb_checkout(kind)
         )
         await start_session(context, user.id, kind, msg_chat=msg.chat_id, msg_id=msg.message_id)
+        await context.bot.send_message(OWNER_ID, f"ورود {('چت' if kind=='chat' else 'کال')}: {mention_html(user)}", parse_mode=ParseMode.HTML)
         await update.message.reply_text("ثبت شد."); return
 
     if txt == "گارد":
@@ -868,30 +828,51 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"حضور چت: {human_td(r['chat_seconds'])} | کال: {human_td(r['call_seconds'])} | دفعات کال: {r['call_sessions']}"
         ); return
 
-    # ==== Moderation in MAIN_CHAT ====
+    # محدود رسانه / آزاد رسانه — فقط ادمین/ارشد/مالک
+    if txt in ("محدود رسانه","آزاد رسانه"):
+        # تشخیص ادمین واقعی یا مالک
+        is_admin = False
+        try:
+            cm = await context.bot.get_chat_member(MAIN_CHAT_ID, user.id)
+            is_admin = cm.status in ("administrator","creator") or is_owner(user.id)
+        except Exception:
+            is_admin = is_owner(user.id)
+        if not is_admin:
+            await update.message.reply_text("فقط ادمین/مالک."); return
+
+        target = extract_target_from_text_or_reply(update)
+        if not target:
+            await update.message.reply_text("روی پیام کاربر ریپلای کنید یا آیدی عددی بنویسید."); return
+
+        if txt == "محدود رسانه":
+            perms = ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=False, can_send_documents=False, can_send_photos=False,
+                can_send_videos=False, can_send_video_notes=False, can_send_voice_notes=False,
+                can_send_polls=False, can_send_other_messages=False, can_add_web_page_previews=False
+            )
+            try:
+                await context.bot.restrict_chat_member(MAIN_CHAT_ID, target, permissions=perms, use_independent_chat_permissions=True)
+                await update.message.reply_text("محدودیت: فقط متن فعال شد.")
+            except Exception:
+                await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
+            return
+        else:
+            perms = ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True, can_send_documents=True, can_send_photos=True,
+                can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True,
+                can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True
+            )
+            try:
+                await context.bot.restrict_chat_member(MAIN_CHAT_ID, target, permissions=perms, use_independent_chat_permissions=True)
+                await update.message.reply_text("همهٔ رسانه‌ها آزاد شدند.")
+            except Exception:
+                await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
+            return
+
+    # سکوت/حذف سکوت (می‌ماند)
     if chat_id == MAIN_CHAT_ID:
-        if txt.startswith(("بن","مسدود","ممنوع")):
-            target = extract_target_from_text_or_reply(update)
-            if not target:
-                await update.message.reply_text("ریپلای یا آیدی لازم است."); return
-            try:
-                await context.bot.ban_chat_member(MAIN_CHAT_ID, target)
-            except Exception:
-                pass
-            await db.execute("INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
-            await update.message.reply_text("کاربر مسدود شد."); return
-
-        if txt.startswith(("آزاد","حذف بن","رهایی")):
-            target = extract_target_from_text_or_reply(update)
-            if not target:
-                await update.message.reply_text("ریپلای یا آیدی لازم است."); return
-            try:
-                await context.bot.unban_chat_member(MAIN_CHAT_ID, target, only_if_banned=True)
-            except Exception:
-                pass
-            await db.execute("DELETE FROM banned_users WHERE user_id=$1", target)
-            await update.message.reply_text("کاربر آزاد شد."); return
-
         if txt.startswith(("سکوت","خفه")):
             target = extract_target_from_text_or_reply(update)
             if not target:
@@ -921,30 +902,79 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
             return
 
-        media_rules = [
-            ("بی استیکر", dict(can_send_other_messages=False)),
-            ("با استیکر", dict(can_send_other_messages=True)),
-            ("بی گیف", dict(can_send_animations=False)),
-            ("با گیف", dict(can_send_animations=True)),
-            ("بی عکس", dict(can_send_photos=False)),
-            ("با عکس", dict(can_send_photos=True)),
-            ("بی فیلم", dict(can_send_videos=False)),
-            ("با فیلم", dict(can_send_videos=True)),
-            ("بی فایل", dict(can_send_documents=False)),
-            ("با فایل", dict(can_send_documents=True)),
-        ]
-        for key, perm in media_rules:
-            if txt.startswith(key):
-                target = extract_target_from_text_or_reply(update)
-                if not target:
-                    await update.message.reply_text("ریپلای لازم است."); return
-                perms = ChatPermissions(**perm)
-                try:
-                    await context.bot.restrict_chat_member(MAIN_CHAT_ID, target, permissions=perms, use_independent_chat_permissions=True)
-                    await update.message.reply_text("اعمال شد.")
-                except Exception:
-                    await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
-                return
+    # ثبت جنسیت + تگ گروهی ساده
+    if txt in ("ثبت پسر","ثبت دختر"):
+        target = extract_target_from_text_or_reply(update)
+        if not target:
+            await update.message.reply_text("روی پیام فرد ریپلای کنید یا آیدی بنویسید."); return
+        await db.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
+        await db.execute("UPDATE users SET gender=$2 WHERE user_id=$1", target, "male" if txt.endswith("پسر") else "female")
+        await update.message.reply_text("ثبت شد."); return
+
+    if txt in ("تگ پسرها","تگ دخترها"):
+        gender = "male" if txt.endswith("پسرها") else "female"
+        ids = await db.fetch("SELECT DISTINCT u.user_id FROM users u JOIN members_stats m ON u.user_id=m.user_id AND m.d=$1 WHERE u.gender=$2 AND m.chat_count>0 LIMIT 30", today(), gender)
+        if not ids:
+            await update.message.reply_text("کسی برای تگ یافت نشد."); return
+        mentions = " ".join([f'<a href="tg://user?id={r["user_id"]}">‎</a>' for r in ids])
+        await update.message.reply_html(f"تگ {('پسرها' if gender=='male' else 'دخترها')}: {mentions}"); return
+
+    # درخواست ادمینی — هر کسی بزند
+    if txt == "درخواست ادمینی":
+        uid = user.id
+        since = today() - timedelta(days=7)
+        # آمار ۷ روزه کاربر از گروه اصلی (فقط چت)
+        row = await db.fetchrow("SELECT COALESCE(SUM(chat_count),0) cnt, MAX(last_active) la FROM members_stats WHERE d >= $1 AND user_id=$2", since, uid)
+        cnt = row["cnt"] or 0
+        la = row["la"]
+        rec = await db.fetchrow("INSERT INTO admin_requests(user_id) VALUES($1) RETURNING id", uid)
+        app_id = rec["id"]
+        text = (f"درخواست ادمینی از {mention_html(user)} (ID <code>{uid}</code>)\n"
+                f"آمار ۷ روزه:\n- مجموع پیام‌های چت: {cnt}\n- آخرین فعالیت: {la}")
+        # ارسال به گارد و مالک
+        for dest in (GUARD_CHAT_ID, OWNER_ID):
+            try:
+                await context.bot.send_message(dest, text, parse_mode=ParseMode.HTML, reply_markup=kb_app_reply(app_id, uid))
+            except Exception:
+                pass
+        await update.message.reply_text("درخواست شما ثبت و برای مالک ارسال شد ✅")
+        return
+
+# --- پاسخ مالک به درخواست ادمینی (One-Shot و انتشار در گروه اصلی) ---
+async def on_app_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != OWNER_ID:
+        await q.answer("فقط مالک!", show_alert=True); return
+    try:
+        _, app_id_s, uid_s = q.data.split("_", 2)
+        app_id = int(app_id_s); uid = int(uid_s)
+    except Exception:
+        return
+    # بستن کیبورد
+    await try_clear_kb(q.message)
+    # یک بار مجوز پیام بعدی مالک
+    context.user_data["one_shot_app_reply"] = (app_id, uid)
+    await q.message.reply_text("پاسخ خود را بنویسید. فقط اولین پیام بعد از این کلیک منتشر می‌شود.")
+
+async def capture_owner_app_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = context.user_data.pop("one_shot_app_reply", None)
+    if not info:
+        return
+    app_id, uid = info
+    # انتشار در گروه اصلی + منشن کاربر
+    try:
+        txt = f"📣 <b>پاسخ مالک</b> به درخواست ادمینی {uid}:\n\n{update.message.text_html if update.message.text else '(بدون متن)'}\n\n<a href=\"tg://user?id={uid}\">دعوت</a>"
+        await context.bot.send_message(MAIN_CHAT_ID, txt, parse_mode=ParseMode.HTML)
+        await db.execute("UPDATE admin_requests SET status='answered' WHERE id=$1", app_id)
+        await update.message.reply_text("پاسخ منتشر شد ✅")
+        # اطلاع به کاربر
+        try:
+            await context.bot.send_message(uid, "پاسخ مالک درباره درخواست شما منتشر شد.")
+        except Exception:
+            pass
+    except Exception:
+        await update.message.reply_text("انتشار پاسخ ناموفق بود.")
 
 # -------------------- Group message capture --------------------
 async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -955,42 +985,42 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     u = msg.from_user
 
-    # همه کاربران را در جدول users/اعضا ثبت/به‌روز کن
     await ensure_user(u)
-
-    # آمار کاربران عادی برای «کاندید ادمینی»
     await bump_member_stats(u.id)
 
-    # اگر ادمین/ارشد/مالک است → آمار ادمین و ورود خودکار
-    is_admin = await db.fetchrow(
+    # تشخیص ادمین: DB یا وضعیت واقعی
+    db_admin = await db.fetchrow(
         "SELECT 1 FROM users WHERE user_id=$1 AND (role IS NOT NULL OR $1=$2)",
         u.id, OWNER_ID
     )
+    is_admin = bool(db_admin)
+    if not is_admin:
+        try:
+            member = await context.bot.get_chat_member(MAIN_CHAT_ID, u.id)
+            is_admin = member.status in ("administrator", "creator") or (u.id == OWNER_ID)
+        except Exception:
+            is_admin = (u.id == OWNER_ID)
+
     if not is_admin:
         return
 
-    # ثبت پیام/ریپلای در daily_stats (فقط گروه اصلی)
     await bump_admin_on_message(msg)
 
-    # اگر سشن چت باز است، فقط last_activity را آپدیت کن
+    # آپدیت فعالیت در صورت سشن باز
     open_chat = await get_open_session(u.id, "chat")
     if open_chat:
         await db.execute("UPDATE sessions SET last_activity_ts=$1 WHERE id=$2", now(), open_chat["id"])
 
-    # ورود خودکار چت در حالت «ح غ روشن»
+    # ورود خودکار چت اگر ح‌غ روشن و سشن باز نیست
     conf = await db.fetchrow("SELECT auto_mode FROM config WHERE id=TRUE")
     if conf and conf["auto_mode"] and not open_chat:
-        # پیام حضور به گارد با دکمه خروج
         guard_msg = await context.bot.send_message(
             GUARD_CHAT_ID,
             f"✔️ ورود خودکار (چت): {mention_html(u)}",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_checkout("chat")
         )
-        # سشن را باز کن (برای تایمر ۱۰ دقیقه بی‌فعالی)
         await start_session(context, u.id, "chat", msg_chat=guard_msg.chat_id, msg_id=guard_msg.message_id)
-
-        # اطلاع به مالک و خودِ ادمین
         try:
             await context.bot.send_message(OWNER_ID, f"✅ ورود چت خودکار: {mention_html(u)}", parse_mode=ParseMode.HTML)
         except Exception:
@@ -1075,8 +1105,15 @@ async def random_tag_job(context: ContextTypes.DEFAULT_TYPE):
     if not rows: return
     uid = rows[0]["user_id"]
     phrase = random.choice(FUN_LINES)
+    mention_text = "👋"
     try:
-        await context.bot.send_message(MAIN_CHAT_ID, f"{phrase}\n<a href=\"tg://user?id={uid}\">‎</a>", parse_mode=ParseMode.HTML)
+        cm = await context.bot.get_chat_member(MAIN_CHAT_ID, uid)
+        display = (cm.user.first_name or "") + (" " + cm.user.last_name if cm.user.last_name else "")
+        mention_text = (display.strip() or (cm.user.username and "@"+cm.user.username) or "دوست")
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(MAIN_CHAT_ID, f"{phrase}\n<a href=\"tg://user?id={uid}\">{mention_text}</a>", parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
@@ -1090,6 +1127,11 @@ async def schedule_jobs(app: Application):
     app.job_queue.run_repeating(send_candidates_report, interval=24*3600, first=seconds_until_midnight()+20, name="candidates")
     app.job_queue.run_repeating(send_watchlist_reports, interval=24*3600, first=seconds_until_midnight()+30, name="watchlist")
     app.job_queue.run_repeating(random_tag_job, interval=900, first=300, name="random_tag")
+
+# -------------------- Owner reply for admin request (callbacks) --------------------
+async def on_app_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # defined above (kept here for handler registration order readability)
+    pass  # replaced above
 
 # -------------------- Bootstrapping --------------------
 async def post_init(app: Application):
@@ -1109,29 +1151,31 @@ def build_app() -> Application:
         .post_shutdown(post_shutdown) \
         .build()
 
-    # /start (CommandHandler — PTB v20)    # /start
+    # /start
     app.add_handler(CommandHandler("start", start), group=0)
 
-    # --- Callbacks (اول اجرا شوند)
+    # Callbacks
     app.add_handler(CallbackQueryHandler(on_contact_btn, pattern="^(contact_guard|contact_owner|back_home|retry_send)$"), group=0)
     app.add_handler(CallbackQueryHandler(on_owner_rate, pattern="^(rate_yes|rate_no)$"), group=0)
     app.add_handler(CallbackQueryHandler(on_checkin_checkout, pattern="^(checkin_chat|checkin_call|checkout_(chat|call)|switch_to_(chat|call))$"), group=0)
     app.add_handler(CallbackQueryHandler(on_my_stats, pattern="^my_stats$"), group=0)
     app.add_handler(CallbackQueryHandler(on_guard_reply_block, pattern="^(reply_|block_)\\d+$"), group=0)
+    app.add_handler(CallbackQueryHandler(on_app_reply, pattern="^app_reply_\\d+_\\d+$"), group=0)
 
-    # --- پیام‌های گارد برای پاسخ ادمین‌ها (One-Shot)
-    # هر نوع پیام در گارد → فقط برای ادمینی که دکمه «پاسخ» زده یک‌بار فوروارد می‌شود
+    # پیام‌های گارد برای پاسخ ادمین‌ها
     app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) & ~filters.StatusUpdate.ALL, capture_admin_reply), group=1)
+    # پیام‌های مالک برای پاسخ به درخواست ادمینی
+    app.add_handler(MessageHandler((filters.Chat(OWNER_ID) & filters.TEXT) & ~filters.StatusUpdate.ALL, capture_owner_app_reply), group=1)
 
-    # --- پیام‌های گروه اصلی (آمار/ورود خودکار) — فقط از MAIN_CHAT_ID
+    # پیام‌های گروه اصلی (آمار/ورود خودکار)
     app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & ~filters.StatusUpdate.ALL, group_message), group=2)
 
-    # --- فلو تماس در پیوی (کاربر → گارد/مالک)
+    # فلو تماس در پیوی (کاربر → گارد/مالک)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.StatusUpdate.ALL, pipe_user_message), group=3)
 
-    # --- دستورات متنی بدون / (در همه‌جا)
+    # دستورات متنی بدون / (در همه‌جا)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_triggers), group=4)
-    
+
     return app
 
 if __name__ == "__main__":
