@@ -1,28 +1,30 @@
-# souls_bot.py — Single-file Telegram bot for Souls team (Railway + PostgreSQL)
-# Language: Python 3.11+ (async)
-#
-# ENV (Railway):
-#   BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ
-#
-# NOTE: Telegram Bot API does not expose reliable voice chat join/leave events.
-#       Call activity is tracked via explicit text/buttons (as per your request).
-#
+# Souls Security Bot — Single-file (Railway + PostgreSQL)
+# PTB v20.x (async)
+# ENV: BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ(Asia/Tehran)
+
 import os
 import re
 import random
-import asyncio
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
 import asyncpg
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler,
-    AIORateLimiter, Application, CommandHandler   # 👈 این را اضافه کن
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, MessageHandler, filters, CallbackQueryHandler,
-    AIORateLimiter, Application
+    ApplicationBuilder,
+    Application,
+    ContextTypes,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    filters,
+    AIORateLimiter,
 )
 
 # -------------------- Config --------------------
@@ -100,7 +102,6 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     last_checkout TIMESTAMPTZ,
     PRIMARY KEY (d, user_id)
 );
-
 CREATE INDEX IF NOT EXISTS idx_daily_stats_d ON daily_stats(d);
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -164,12 +165,17 @@ class DB:
         if self.pool:
             await self.pool.close()
 
-    async def fetch(self, q, *a): 
-        async with self.pool.acquire() as c: return await c.fetch(q, *a)
-    async def fetchrow(self, q, *a): 
-        async with self.pool.acquire() as c: return await c.fetchrow(q, *a)
-    async def execute(self, q, *a): 
-        async with self.pool.acquire() as c: return await c.execute(q, *a)
+    async def fetch(self, q, *a):
+        async with self.pool.acquire() as c:
+            return await c.fetch(q, *a)
+
+    async def fetchrow(self, q, *a):
+        async with self.pool.acquire() as c:
+            return await c.fetchrow(q, *a)
+
+    async def execute(self, q, *a):
+        async with self.pool.acquire() as c:
+            return await c.execute(q, *a)
 
 db = DB(DATABASE_URL)
 
@@ -218,7 +224,7 @@ WELCOME_TEXT = (
     "برای ارتباط با گارد مدیران یا مالک از دکمه‌ها استفاده کنید."
 )
 
-# -------------------- Utility logic --------------------
+# -------------------- Utility --------------------
 async def ensure_user(u):
     await db.execute(
         """INSERT INTO users(user_id,first_name,last_name,username)
@@ -266,8 +272,14 @@ async def bump_admin_on_message(message):
 
 async def get_open_session(uid: int, kind: str | None = None):
     if kind:
-        return await db.fetchrow("SELECT * FROM sessions WHERE user_id=$1 AND kind=$2 AND end_ts IS NULL ORDER BY id DESC LIMIT 1", uid, kind)
-    return await db.fetchrow("SELECT * FROM sessions WHERE user_id=$1 AND end_ts IS NULL ORDER BY id DESC LIMIT 1", uid)
+        return await db.fetchrow(
+            "SELECT * FROM sessions WHERE user_id=$1 AND kind=$2 AND end_ts IS NULL ORDER BY id DESC LIMIT 1",
+            uid, kind
+        )
+    return await db.fetchrow(
+        "SELECT * FROM sessions WHERE user_id=$1 AND end_ts IS NULL ORDER BY id DESC LIMIT 1",
+        uid
+    )
 
 async def start_session(context: ContextTypes.DEFAULT_TYPE, uid: int, kind: str, msg_chat=None, msg_id=None):
     ex = await get_open_session(uid, kind)
@@ -286,8 +298,7 @@ async def start_session(context: ContextTypes.DEFAULT_TYPE, uid: int, kind: str,
         today(), uid, now()
     )
     if kind == "chat":
-        # schedule inactivity checker (10 min)
-        await schedule_inactivity(context, rec["id"])
+        await schedule_inactivity(context, rec["id"])  # 10-minute idle watcher
     return rec["id"]
 
 async def end_session(context: ContextTypes.DEFAULT_TYPE, sess_id: int, reason="manual"):
@@ -306,15 +317,19 @@ async def end_session(context: ContextTypes.DEFAULT_TYPE, sess_id: int, reason="
               {col}=daily_stats.{col}+$3, last_checkout=$4 {inc_call}""",
         today(), sess["user_id"], dur, end_ts
     )
-    # clean inline message if exists
+    # clean inline msg if exists
     if sess["open_msg_chat"] and sess["open_msg_id"]:
-        try: await context.bot.delete_message(sess["open_msg_chat"], sess["open_msg_id"])
-        except Exception: pass
-    # notify
+        try:
+            await context.bot.delete_message(sess["open_msg_chat"], sess["open_msg_id"])
+        except Exception:
+            pass
+    # notify guard + owner
     txt = f"{'⛔️' if reason!='manual' else '❌'} خروج {('چت' if sess['kind']=='chat' else 'کال')} — مدت: {human_td(dur)}"
     for ch in [GUARD_CHAT_ID, OWNER_ID]:
-        try: await context.bot.send_message(ch, txt)
-        except Exception: pass
+        try:
+            await context.bot.send_message(ch, txt)
+        except Exception:
+            pass
 
 async def schedule_inactivity(context: ContextTypes.DEFAULT_TYPE, sess_id: int):
     name = f"inact_{sess_id}"
@@ -340,7 +355,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_html(WELCOME_TEXT, reply_markup=HOME_KB)
 
-# contact buttons
 async def on_contact_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.data in ("contact_guard","contact_owner"):
@@ -376,7 +390,10 @@ async def pipe_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.message: await update.message.reply_text("ارسال ناموفق بود.")
         return
     if sent:
-        rec = await db.fetchrow("INSERT INTO contact_threads(user_id,channel,last_forwarded_msg,last_forwarded_chat) VALUES($1,$2,$3,$4) RETURNING id", u.id, channel, sent.message_id, dest)
+        rec = await db.fetchrow(
+            "INSERT INTO contact_threads(user_id,channel,last_forwarded_msg,last_forwarded_chat) VALUES($1,$2,$3,$4) RETURNING id",
+            u.id, channel, sent.message_id, dest
+        )
         try: await sent.edit_reply_markup(kb_reply_block(rec["id"]))
         except Exception: pass
         await update.message.reply_text("پیام شما ارسال شد ✅", reply_markup=kb_back_retry())
@@ -414,17 +431,18 @@ async def capture_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         await update.message.reply_text("ارسال پاسخ ناموفق بود.")
 
-# owner rating
 async def on_owner_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != OWNER_ID:
         await q.answer("فقط مالک!", show_alert=True); return
     await q.answer()
     val = True if q.data.endswith("yes") else False
-    await db.execute("INSERT INTO ratings(d,rater_id,rating) VALUES($1,$2,$3) ON CONFLICT (d,rater_id) DO UPDATE SET rating=$3", today(), OWNER_ID, val)
+    await db.execute(
+        "INSERT INTO ratings(d,rater_id,rating) VALUES($1,$2,$3) ON CONFLICT (d,rater_id) DO UPDATE SET rating=$3",
+        today(), OWNER_ID, val
+    )
     await q.message.reply_text("ثبت شد.")
 
-# checkin/checkout/switch
 async def on_checkin_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     u = q.from_user; await ensure_user(u)
@@ -439,7 +457,8 @@ async def on_checkin_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif q.data.startswith("checkout_"):
         kind = q.data.split("_",1)[1]
         sess = await get_open_session(u.id, kind)
-        if not sess: await q.message.reply_text("جلسه‌ای باز نیست."); return
+        if not sess:
+            await q.message.reply_text("جلسه‌ای باز نیست."); return
         await end_session(context, sess["id"], reason="درخواست کاربر")
     elif q.data in ("switch_to_chat","switch_to_call"):
         target = "chat" if q.data.endswith("chat") else "call"
@@ -454,7 +473,8 @@ async def on_my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     uid = q.from_user.id
     r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", today(), uid)
-    if not r: await q.message.reply_text("امروز آماری ندارید."); return
+    if not r:
+        await q.message.reply_text("امروز آماری ندارید."); return
     txt = (f"آمار امروز:\n"
            f"- پیام‌های چت: {r['chat_messages']}\n"
            f"- ریپلای زده/دریافت: {r['replies_sent']}/{r['replies_received']}\n"
@@ -468,20 +488,41 @@ RE_OWNER_TOGGLE = {"ح غ روشن": True, "ح غ خاموش": False}
 RE_RANDOM_TAG = {"تگ رندوم روشن": True, "تگ رندوم خاموش": False}
 
 def extract_target_from_text_or_reply(update: Update):
-    # priority: reply target -> numeric id in text
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
         return update.message.reply_to_message.from_user.id
     m = re.search(r"(\d{4,})", update.message.text)
     return int(m.group(1)) if m else None
 
+OWNER_HELP = (
+    "راهنمای مالک (دستورات بدون /):\n"
+    "• ح غ روشن / ح غ خاموش — ثبت خودکار ورود چت با اولین پیام\n"
+    "• تگ رندوم روشن / تگ رندوم خاموش — هر ۱۵ دقیقه یک منشن فان\n"
+    "• پینگ — بررسی سرعت پاسخ ربات\n"
+    "• ترفیع چت / عزل چت — روی ریپلای یا با آیدی\n"
+    "• ترفیع کال / عزل کال — روی ریپلای یا با آیدی\n"
+    "• ترفیع ارشدچت / عزل ارشدچت\n"
+    "• ترفیع ارشدکال / عزل ارشدکال\n"
+    "• ترفیع ارشدکل / عزل ارشدکل\n"
+    "• ترفیع کانال / عزل کانال\n"
+    "• آمار چت الان / آمار کال الان — تا این لحظه\n"
+    "• آمار — تعداد کاربران فعال امروز گروه اصلی\n"
+    "• آمار کلی کاربر <آیدی> — گزارش ۳۰ روز گذشته کاربر\n"
+    "• ممنوع <آیدی> — اضافه به لیست ممنوع (بن در ورود)\n"
+    "• آزاد <آیدی> — حذف از لیست ممنوع\n"
+    "• زیرنظر+<آیدی> — گزارش شبانهٔ ویژه به گارد و مالک\n"
+)
+
 async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
+    if not update.message or not update.message.text:
+        return
     txt = update.message.text.strip()
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # Owner toggles & utilities
+    # ==== OWNER-ONLY (no slash) ====
     if is_owner(user.id):
+        if txt == "راهنما":
+            await update.message.reply_text(OWNER_HELP); return
         if txt in RE_OWNER_TOGGLE:
             await db.execute("UPDATE config SET auto_mode=$1 WHERE id=TRUE", RE_OWNER_TOGGLE[txt])
             await update.message.reply_text(f"ح غ {'روشن' if RE_OWNER_TOGGLE[txt] else 'خاموش'} شد."); return
@@ -489,9 +530,10 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.execute("UPDATE config SET random_tag=$1 WHERE id=TRUE", RE_RANDOM_TAG[txt])
             await update.message.reply_text(f"تگ رندوم {'روشن' if RE_RANDOM_TAG[txt] else 'خاموش'} شد."); return
         if txt == "پینگ":
-            t1 = datetime.now(timezone.utc); m = await update.message.reply_text("پینگ..."); t2 = datetime.now(timezone.utc)
+            t1 = datetime.now(timezone.utc); m = await update.message.reply_text("پینگ...")
+            t2 = datetime.now(timezone.utc)
             await m.edit_text(f"پینگ: {int((t2-t1).total_seconds()*1000)} ms"); return
-        # Promotions / demotions (reply or id)
+
         role_map = {
             "ترفیع چت": "chat_admin", "عزل چت": None,
             "ترفیع کال": "call_admin", "عزل کال": None,
@@ -505,11 +547,14 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not target:
                 await update.message.reply_text("روی پیام فرد ریپلای کنید یا آیدی عددی بنویسید."); return
             await db.execute("INSERT INTO users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
-            await db.execute("UPDATE users SET role=$2, joined_guard_at=COALESCE(joined_guard_at, NOW()) WHERE user_id=$1", target, role_map[txt])
+            await db.execute(
+                "UPDATE users SET role=$2, joined_guard_at=COALESCE(joined_guard_at, NOW()) WHERE user_id=$1",
+                target, role_map[txt]
+            )
             await context.bot.send_message(GUARD_CHAT_ID, f"🔧 {txt} برای <code>{target}</code>", parse_mode=ParseMode.HTML)
             await context.bot.send_message(OWNER_ID, f"🔧 {txt} برای <code>{target}</code>", parse_mode=ParseMode.HTML)
             await update.message.reply_text("انجام شد."); return
-        # Stats now (chat / call)
+
         if txt == "آمار چت الان":
             rows = await db.fetch("""
                 SELECT u.user_id,u.role, COALESCE(s.chat_messages,0) msgs, COALESCE(s.chat_seconds,0) chat_time
@@ -520,6 +565,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for r in rows:
                 lines.append(f"{r['role']}: {r['user_id']} | پیام: {r['msgs']} | حضور: {human_td(r['chat_time'])}")
             await update.message.reply_text("\n".join(lines), reply_markup=kb_owner_rate()); return
+
         if txt == "آمار کال الان":
             rows = await db.fetch("""
                 SELECT u.user_id,u.role, COALESCE(s.call_seconds,0) call_time, COALESCE(s.call_sessions,0) calls
@@ -530,25 +576,15 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for r in rows:
                 lines.append(f"{r['role']}: {r['user_id']} | زمان کال: {human_td(r['call_time'])} | دفعات: {r['calls']}")
             await update.message.reply_text("\n".join(lines), reply_markup=kb_owner_rate()); return
-        # Ban by ID even if not present
-        if txt.startswith("ممنوع"):
-            m = re.search(r"(\d{4,})", txt)
-            if not m: await update.message.reply_text("آیدی عددی را بنویسید."); return
-            uid = int(m.group(1))
-            await db.execute("INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
-            await update.message.reply_text("در لیست ممنوع اضافه شد."); return
-        if txt.startswith("آزاد "):
-            m = re.search(r"(\d{4,})", txt); 
-            if not m: await update.message.reply_text("آیدی عددی را بنویسید."); return
-            uid = int(m.group(1))
-            await db.execute("DELETE FROM banned_users WHERE user_id=$1", uid)
-            await update.message.reply_text("از لیست ممنوع حذف شد."); return
+
         if txt == "آمار":
             row = await db.fetchrow("SELECT COUNT(DISTINCT user_id) c FROM members_stats WHERE d=$1 AND chat_count>0", today())
             await update.message.reply_text(f"تعداد کاربران فعال امروز: {row['c']}"); return
+
         if txt.startswith("آمار کلی کاربر"):
-            m = re.search(r"(\d{4,})", txt); 
-            if not m: await update.message.reply_text("آیدی عددی را بنویسید."); return
+            m = re.search(r"(\d{4,})", txt)
+            if not m:
+                await update.message.reply_text("آیدی عددی را بنویسید."); return
             uid = int(m.group(1)); since = today() - timedelta(days=30)
             r = await db.fetchrow("""
                 SELECT COALESCE(SUM(chat_messages),0) msgs,
@@ -565,57 +601,95 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"- زمان چت: {human_td(r['chat_s'])}\n"
                 f"- زمان کال: {human_td(r['call_s'])} | دفعات کال: {r['calls']}"
             ); return
+
+        if txt.startswith("ممنوع"):
+            m = re.search(r"(\d{4,})", txt)
+            if not m:
+                await update.message.reply_text("آیدی عددی را بنویسید."); return
+            uid = int(m.group(1))
+            await db.execute("INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
+            await update.message.reply_text("در لیست ممنوع اضافه شد."); return
+
+        if txt.startswith("آزاد "):
+            m = re.search(r"(\d{4,})", txt)
+            if not m:
+                await update.message.reply_text("آیدی عددی را بنویسید."); return
+            uid = int(m.group(1))
+            await db.execute("DELETE FROM banned_users WHERE user_id=$1", uid)
+            await update.message.reply_text("از لیست ممنوع حذف شد."); return
+
         if txt.startswith("زیرنظر"):
             m = re.search(r"(\d{4,})", txt)
-            if not m: await update.message.reply_text("آیدی عددی را بنویسید."); return
+            if not m:
+                await update.message.reply_text("آیدی عددی را بنویسید."); return
             uid = int(m.group(1))
             await db.execute("INSERT INTO watchlist(user_id) VALUES($1) ON CONFLICT DO NOTHING", uid)
             await update.message.reply_text("کاربر به لیست زیرنظر افزوده شد."); return
 
-    # Generic controls (admins/owner)
+    # ==== GENERIC (admins/owner) ====
     if txt == "ثبت":
         await update.message.reply_text("نوع فعالیت را انتخاب کنید:", reply_markup=kb_checkin()); return
+
     if txt == "تغییر فعالیت":
         await update.message.reply_text("به چه فعالیتی تغییر کنم؟", reply_markup=kb_switch()); return
+
     if txt in ("ثبت خروج","خروج چت","خروج کال"):
         kind = "chat" if txt != "خروج کال" else "call"
         sess = await get_open_session(user.id, None if txt=="ثبت خروج" else kind)
-        if not sess: await update.message.reply_text("جلسه‌ای باز نیست."); return
+        if not sess:
+            await update.message.reply_text("جلسه‌ای باز نیست."); return
         await end_session(context, sess["id"], reason="درخواست متنی"); return
+
     if txt in ("ورود چت","ورود کال"):
         kind = "chat" if txt == "ورود چت" else "call"
-        msg = await context.bot.send_message(GUARD_CHAT_ID, f"ورود {('چت' if kind=='chat' else 'کال')}: {mention_html(user)}", parse_mode=ParseMode.HTML, reply_markup=kb_checkout(kind))
+        msg = await context.bot.send_message(
+            GUARD_CHAT_ID,
+            f"ورود {('چت' if kind=='chat' else 'کال')}: {mention_html(user)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_checkout(kind)
+        )
         await start_session(context, user.id, kind, msg_chat=msg.chat_id, msg_id=msg.message_id)
         await update.message.reply_text("ثبت شد."); return
+
     if txt == "گارد":
         r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", today(), user.id)
-        if not r: await update.message.reply_text("امروز آماری ندارید."); return
+        if not r:
+            await update.message.reply_text("امروز آماری ندارید."); return
         await update.message.reply_text(
-            f"آمار امروز:\nپیام‌ها: {r['chat_messages']}\nریپلای زده/دریافت: {r['replies_sent']}/{r['replies_received']}\n"
+            f"آمار امروز:\n"
+            f"پیام‌ها: {r['chat_messages']}\n"
+            f"ریپلای زده/دریافت: {r['replies_sent']}/{r['replies_received']}\n"
             f"حضور چت: {human_td(r['chat_seconds'])} | کال: {human_td(r['call_seconds'])} | دفعات کال: {r['call_sessions']}"
         ); return
 
-    # Moderation in main group
+    # ==== Moderation in MAIN_CHAT ====
     if chat_id == MAIN_CHAT_ID:
-        # ban / unban
         if txt.startswith(("بن","مسدود","ممنوع")):
             target = extract_target_from_text_or_reply(update)
-            if not target: await update.message.reply_text("ریپلای یا آیدی لازم است."); return
-            try: await context.bot.ban_chat_member(MAIN_CHAT_ID, target)
-            except Exception: pass
+            if not target:
+                await update.message.reply_text("ریپلای یا آیدی لازم است."); return
+            try:
+                await context.bot.ban_chat_member(MAIN_CHAT_ID, target)
+            except Exception:
+                pass
             await db.execute("INSERT INTO banned_users(user_id) VALUES($1) ON CONFLICT DO NOTHING", target)
             await update.message.reply_text("کاربر مسدود شد."); return
+
         if txt.startswith(("آزاد","حذف بن","رهایی")):
             target = extract_target_from_text_or_reply(update)
-            if not target: await update.message.reply_text("ریپلای یا آیدی لازم است."); return
-            try: await context.bot.unban_chat_member(MAIN_CHAT_ID, target, only_if_banned=True)
-            except Exception: pass
+            if not target:
+                await update.message.reply_text("ریپلای یا آیدی لازم است."); return
+            try:
+                await context.bot.unban_chat_member(MAIN_CHAT_ID, target, only_if_banned=True)
+            except Exception:
+                pass
             await db.execute("DELETE FROM banned_users WHERE user_id=$1", target)
             await update.message.reply_text("کاربر آزاد شد."); return
-        # silence
+
         if txt.startswith(("سکوت","خفه")):
             target = extract_target_from_text_or_reply(update)
-            if not target: await update.message.reply_text("ریپلای لازم است."); return
+            if not target:
+                await update.message.reply_text("ریپلای لازم است."); return
             perms = ChatPermissions(can_send_messages=False)
             try:
                 await context.bot.restrict_chat_member(MAIN_CHAT_ID, target, permissions=perms, use_independent_chat_permissions=True)
@@ -623,9 +697,11 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
             return
+
         if "حذف سکوت" in txt or "حذف خفه" in txt:
             target = extract_target_from_text_or_reply(update)
-            if not target: await update.message.reply_text("ریپلای لازم است."); return
+            if not target:
+                await update.message.reply_text("ریپلای لازم است."); return
             perms = ChatPermissions(
                 can_send_messages=True,
                 can_send_photos=True, can_send_videos=True, can_send_audios=True,
@@ -638,7 +714,7 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text("نیاز به دسترسی ادمین دارم.")
             return
-        # media restrictions
+
         media_rules = [
             ("بی استیکر", dict(can_send_other_messages=False)),
             ("با استیکر", dict(can_send_other_messages=True)),
@@ -654,7 +730,8 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key, perm in media_rules:
             if txt.startswith(key):
                 target = extract_target_from_text_or_reply(update)
-                if not target: await update.message.reply_text("ریپلای لازم است."); return
+                if not target:
+                    await update.message.reply_text("ریپلای لازم است."); return
                 perms = ChatPermissions(**perm)
                 try:
                     await context.bot.restrict_chat_member(MAIN_CHAT_ID, target, permissions=perms, use_independent_chat_permissions=True)
@@ -665,20 +742,27 @@ async def text_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------------------- Group message capture --------------------
 async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MAIN_CHAT_ID: return
+    if update.effective_chat.id != MAIN_CHAT_ID:
+        return
     msg = update.message; u = msg.from_user
     await ensure_user(u)
     await bump_member_stats(u.id)
 
-    # If user is admin/senior/owner -> bump
-    is_admin = await db.fetchrow("SELECT 1 FROM users WHERE user_id=$1 AND (role IS NOT NULL OR $1=$2)", u.id, OWNER_ID)
+    is_admin = await db.fetchrow(
+        "SELECT 1 FROM users WHERE user_id=$1 AND (role IS NOT NULL OR $1=$2)", u.id, OWNER_ID
+    )
     if is_admin:
         await bump_admin_on_message(msg)
         conf = await db.fetchrow("SELECT auto_mode FROM config WHERE id=TRUE")
         if conf and conf["auto_mode"]:
             sess = await get_open_session(u.id, "chat")
             if not sess:
-                m = await context.bot.send_message(GUARD_CHAT_ID, f"✔️ ورود خودکار (چت): {mention_html(u)}", parse_mode=ParseMode.HTML, reply_markup=kb_checkout("chat"))
+                m = await context.bot.send_message(
+                    GUARD_CHAT_ID,
+                    f"✔️ ورود خودکار (چت): {mention_html(u)}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb_checkout("chat")
+                )
                 await start_session(context, u.id, "chat", msg_chat=m.chat_id, msg_id=m.message_id)
             else:
                 await db.execute("UPDATE sessions SET last_activity_ts=$1 WHERE id=$2", now(), sess["id"])
@@ -687,7 +771,6 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
     d = today() - timedelta(days=1)
     rows = await db.fetch("SELECT * FROM daily_stats WHERE d=$1", d)
-    # per-user DMs
     for r in rows:
         uid = r["user_id"]
         txt = (f"گزارش روزانه ({d}):\n"
@@ -699,7 +782,7 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
                f"- آخرین خروج: {r['last_checkout']}")
         try: await context.bot.send_message(uid, txt)
         except Exception: pass
-    # aggregate
+
     agg = await db.fetch("""
         SELECT u.user_id,u.role, COALESCE(s.chat_messages,0) chat_messages,
                COALESCE(s.call_seconds,0) call_seconds,
@@ -727,7 +810,10 @@ async def send_daily_reports(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_candidates_report(context: ContextTypes.DEFAULT_TYPE):
     d = today() - timedelta(days=1)
-    rows = await db.fetch("""SELECT user_id, chat_count FROM members_stats WHERE d=$1 ORDER BY chat_count DESC LIMIT 10""", d)
+    rows = await db.fetch(
+        "SELECT user_id, chat_count FROM members_stats WHERE d=$1 ORDER BY chat_count DESC LIMIT 10",
+        d
+    )
     lines = [f"۱۰ کاربر برتر چت ({d})"]
     for i, r in enumerate(rows, start=1):
         lines.append(f"{i}. ID {r['user_id']} — پیام: {r['chat_count']}")
@@ -740,7 +826,7 @@ async def send_watchlist_reports(context: ContextTypes.DEFAULT_TYPE):
     if not watch: return
     for w in watch:
         uid = w["user_id"]
-        r = await db.fetchrow("""SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2""", d, uid)
+        r = await db.fetchrow("SELECT * FROM daily_stats WHERE d=$1 AND user_id=$2", d, uid)
         if not r: continue
         txt = (f"زیرنظر ({d}) برای {uid}:\n"
                f"- پیام: {r['chat_messages']}, ریپلای ز/د: {r['replies_sent']}/{r['replies_received']}\n"
@@ -756,8 +842,10 @@ async def random_tag_job(context: ContextTypes.DEFAULT_TYPE):
     if not rows: return
     uid = rows[0]["user_id"]
     phrase = random.choice(FUN_LINES)
-    try: await context.bot.send_message(MAIN_CHAT_ID, f"{phrase}\n<a href=\"tg://user?id={uid}\">‎</a>", parse_mode=ParseMode.HTML)
-    except Exception: pass
+    try:
+        await context.bot.send_message(MAIN_CHAT_ID, f"{phrase}\n<a href=\"tg://user?id={uid}\">‎</a>", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 def seconds_until_midnight() -> int:
     n = now(); tomorrow = (n + timedelta(days=1)).date()
@@ -781,31 +869,35 @@ async def post_shutdown(app: Application):
     print("DB closed.")
 
 def build_app() -> Application:
-    app = ApplicationBuilder()\
-        .token(BOT_TOKEN)\
-        .rate_limiter(AIORateLimiter())\
-        .post_init(post_init)\
-        .post_shutdown(post_shutdown)\
+    app = ApplicationBuilder() \
+        .token(BOT_TOKEN) \
+        .rate_limiter(AIORateLimiter()) \
+        .post_init(post_init) \
+        .post_shutdown(post_shutdown) \
         .build()
 
-    # /start
+    # /start (CommandHandler — PTB v20)
     app.add_handler(CommandHandler("start", start))
 
-    # callbacks
+    # Callbacks
     app.add_handler(CallbackQueryHandler(on_contact_btn, pattern="^(contact_guard|contact_owner|back_home|retry_send)$"))
     app.add_handler(CallbackQueryHandler(on_owner_rate, pattern="^(rate_yes|rate_no)$"))
     app.add_handler(CallbackQueryHandler(on_checkin_checkout, pattern="^(checkin_chat|checkin_call|checkout_(chat|call)|switch_to_(chat|call))$"))
     app.add_handler(CallbackQueryHandler(on_my_stats, pattern="^my_stats$"))
+    app.add_handler(CallbackQueryHandler(on_guard_reply_block, pattern="^(reply_|block_)\\d+$"))
 
-    # contact flows
+    # Contact flows
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE) & filters.ChatType.PRIVATE, pipe_user_message))
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.VOICE) & filters.Chat(GUARD_CHAT_ID), capture_admin_reply))
 
-    # text triggers
+    # Text triggers (no slash)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_triggers))
 
-    # group capture
-    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO | filters.STICKER | filters.VOICE | filters.VIDEO | filters.ANIMATION) & filters.Chat(MAIN_CHAT_ID), group_message))
+    # Group capture (main chat)
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.STICKER | filters.VOICE | filters.VIDEO | filters.ANIMATION) & filters.Chat(MAIN_CHAT_ID),
+        group_message
+    ))
     return app
 
 if __name__ == "__main__":
