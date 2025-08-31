@@ -36,7 +36,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from typing import Optional, Callable, Awaitable, Any
 
 import asyncpg
@@ -643,6 +643,12 @@ def schedule_jobs(app: Application):
             job.schedule_removal()
 
     # Nightly at 00:10
+    jq.run_daily(job_nightly, time=time(hour=0, minute=10, tzinfo=LOCAL_TZ), name="nightly")
+    # Every 15 minutes
+    jq.run_repeating(job_random_tag, interval=900, first=30, name="random_tag")
+
+
+    # Nightly at 00:10
     jq.run_daily(job_nightly, time=datetime.time(hour=0, minute=10, tzinfo=LOCAL_TZ), name="nightly")
     # Every 15 minutes
     jq.run_repeating(job_random_tag, interval=900, first=30, name="random_tag")
@@ -704,25 +710,22 @@ def build_app() -> Application:
     return app
 
 
-async def main():
+def main():
     global db
-    db = await init_db()
+    db = asyncio.run(init_db())
     app = build_app()
-    # Polling
-    await app.initialize()
+    # Polling (blocking)
     try:
-        await app.start()
         log.info("Bot started (polling)")
-        await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-        await app.updater.idle()
+        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     finally:
-        await app.stop()
-        await db.pool.close()
+        asyncio.run(db.pool.close())
         log.info("Bot stopped")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         pass
+
