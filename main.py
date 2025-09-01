@@ -324,22 +324,22 @@ def reply_again_buttons(user_id: int):
     kb = [[InlineKeyboardButton("↩️ پاسخ مجدد", callback_data=f"guard_reply:{user_id}")]]
     return InlineKeyboardMarkup(kb)
 
-def send_again_buttons():
-    kb = [[InlineKeyboardButton("📨 ارسال مجدد", callback_data="send_again")]]
+def send_again_buttons(user_id: int):
+    kb = [[InlineKeyboardButton("📨 ارسال مجدد", callback_data=f"send_again:{user_id}")]]
     return InlineKeyboardMarkup(kb)
 
-def session_choice_buttons():
-    kb = [[InlineKeyboardButton("🎙 کال", callback_data="session:start:call"),
-           InlineKeyboardButton("💬 چت", callback_data="session:start:chat")]]
+def session_choice_buttons(user_id: int):
+    kb = [[InlineKeyboardButton("🎙 کال", callback_data=f"session:start:call:{user_id}"),
+           InlineKeyboardButton("💬 چت",  callback_data=f"session:start:chat:{user_id}")]]
     return InlineKeyboardMarkup(kb)
 
-def tag_panel():
+def tag_panel(user_id: int):
     kb = [
-        [InlineKeyboardButton("🎙 تگ کال", callback_data="tag:call"),
-         InlineKeyboardButton("💬 تگ چت", callback_data="tag:chat")],
-        [InlineKeyboardButton("🔥 تگ اعضای فعال", callback_data="tag:active")],
-        [InlineKeyboardButton("👧 تگ دخترها", callback_data="tag:female"),
-         InlineKeyboardButton("👦 تگ پسرها", callback_data="tag:male")]
+        [InlineKeyboardButton("🎙 تگ کال", callback_data=f"tag:call:{user_id}"),
+         InlineKeyboardButton("💬 تگ چت",  callback_data=f"tag:chat:{user_id}")],
+        [InlineKeyboardButton("🔥 تگ اعضای فعال", callback_data=f"tag:active:{user_id}")],
+        [InlineKeyboardButton("👧 تگ دخترها", callback_data=f"tag:female:{user_id}"),
+         InlineKeyboardButton("👦 تگ پسرها",  callback_data=f"tag:male:{user_id}")]
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -595,6 +595,17 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=start_menu()
         )
 
+def _must_be_initiator(q, expected_id: int) -> bool:
+    """Allow only the user who opened the panel to use its buttons."""
+    if q.from_user.id != expected_id:
+        try:
+            import asyncio
+            asyncio.create_task(q.answer("این دکمه مخصوص درخواست‌کننده است.", show_alert=True))
+        except Exception:
+            pass
+        return False
+    return True
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -606,18 +617,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mode == "guard":
             await q.message.edit_text(
                 "پیامت رو همینجا بفرست. فقط اولین پیام منتقل میشه؛ برای پیام بعدی روی «ارسال مجدد» بزن.",
-                reply_markup=send_again_buttons()
+                reply_markup=send_again_buttons(q.from_user.id)
             )
         else:
             await q.message.edit_text(
                 "در ارتباط با مالک هستی. اولین پیامت منتقل میشه؛ برای پیام بعدی «ارسال مجدد».",
-                reply_markup=send_again_buttons()
+                reply_markup=send_again_buttons(q.from_user.id)
             )
         return
 
-    if data == "send_again":
+    if data.startswith("send_again"):
+        parts = data.split(":")
+        expected = int(parts[1]) if len(parts)>=2 else q.from_user.id
+        if not _must_be_initiator(q, expected):
+            return
         await allow_user_send_again(q.from_user.id)
-        await q.message.reply_text("اوکی؛ پیام بعدی که بفرستی منتقل میشه.")
+        try:
+            await q.message.edit_text("اوکی؛ پیام بعدی که بفرستی منتقل میشه.", reply_markup=None)
+        except Exception:
+            await q.message.reply_text("اوکی؛ پیام بعدی که بفرستی منتقل میشه.")
         return
 
     if data == "mystats":
@@ -660,9 +678,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("tag:"):
-        _, kind = data.split(":")
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, kind, expected = parts
+            if not _must_be_initiator(q, int(expected)):
+                return
+        else:
+            _, kind = parts
         reply_to = q.message.reply_to_message.message_id if q.message and q.message.reply_to_message else None
         await do_tag(kind, update, context, reply_to=reply_to)
+        try:
+            await q.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
 
     if data.startswith("gender:"):
@@ -706,7 +734,7 @@ async def bridge_from_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception(e)
 
     await after_user_sent_contact(user_id)
-    await update.message.reply_text("پیامت منتقل شد ✔️", reply_markup=send_again_buttons())
+    await update.message.reply_text("پیامت منتقل شد ✔️", reply_markup=send_again_buttons(update.effective_user.id))
 
 async def guard_reply_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Listen in guard chat; if an admin has active reply_state, forward next message to target user once."""
@@ -777,7 +805,7 @@ async def on_main_group_message(update: Update, context: ContextTypes.DEFAULT_TY
         st = await active_session_type(u.id)
         if not st:
             try:
-                await msg.reply_text("حضور رو ثبت کنیم؟", reply_markup=session_choice_buttons())
+                await msg.reply_text("حضور رو ثبت کنیم؟", reply_markup=session_choice_buttons(u.id))
             except Exception:
                 pass
 
@@ -900,7 +928,7 @@ async def on_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # tag open panel
     if t.startswith("تگ") and t == "تگ":
-        await update.message.reply_text("کدوم دسته رو تگ کنم؟", reply_markup=tag_panel())
+        await update.message.reply_text("کدوم دسته رو تگ کنم؟", reply_markup=tag_panel(u.id))
         return
 
     # gender
@@ -913,7 +941,7 @@ async def on_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # session manual
     if t in ("ثبت", "ثبت حضور"):
-        await update.message.reply_text("نوع فعالیت رو انتخاب کن:", reply_markup=session_choice_buttons())
+        await update.message.reply_text("نوع فعالیت رو انتخاب کن:", reply_markup=session_choice_buttons(u.id))
         return
     if t in ("ثبت خروج", "پایان"):
         await end_session_if_exists(u.id, reason="manual")
