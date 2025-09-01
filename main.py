@@ -101,6 +101,16 @@ class DB:
                 last_active TIMESTAMP WITH TIME ZONE,
                 joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             );
+            -- migrate-safe: ensure new columns exist even if users table was created in older versions
+            ALTER TABLE IF EXISTS users
+                ADD COLUMN IF NOT EXISTS first_name TEXT,
+                ADD COLUMN IF NOT EXISTS last_name TEXT,
+                ADD COLUMN IF NOT EXISTS username TEXT,
+                ADD COLUMN IF NOT EXISTS username_lc TEXT,
+                ADD COLUMN IF NOT EXISTS gender TEXT,
+                ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS last_active TIMESTAMP WITH TIME ZONE,
+                ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
             CREATE UNIQUE INDEX IF NOT EXISTS users_username_lc_idx ON users(username_lc) WHERE username_lc IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS roles (
