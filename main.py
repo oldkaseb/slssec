@@ -49,6 +49,7 @@ if not BOT_TOKEN or not DATABASE_URL or not MAIN_CHAT_ID or not GUARD_CHAT_ID or
 
 ADMIN_REPLY_STATE: Dict[int, int] = {}
 USER_ROUTE_STATE: Dict[int, str] = {}
+USER_LAST_ROUTE: Dict[int, str] = {}
 SESSION_IDLE_TASKS: Dict[int, asyncio.Task] = {}
 GAME_STATE: Dict[int, Dict[str, Any]] = {}
 
@@ -375,7 +376,9 @@ async def start_cmd(msg: Message):
 
 @r_priv.callback_query(F.data.in_(["pm_guard","pm_owner"]))
 async def pm_route(cb: CallbackQuery):
-    USER_ROUTE_STATE[cb.from_user.id] = "guard" if cb.data=="pm_guard" else "owner"
+    route = "guard" if cb.data=="pm_guard" else "owner"
+    USER_ROUTE_STATE[cb.from_user.id] = route
+    USER_LAST_ROUTE[cb.from_user.id] = route
     await db.upsert_user(cb.from_user)
     await cb.message.answer("پیامت رو بفرست؛ هر نوع پیامی مجازه. بعد از ارسال، می‌تونی «ارسال مجدد» بزنی.")
     await cb.answer()
@@ -397,12 +400,14 @@ async def back_menu(cb: CallbackQuery):
 
 @r_priv.callback_query(F.data=="resend")
 async def resend(cb: CallbackQuery):
+    route = USER_LAST_ROUTE.get(cb.from_user.id, "guard")
+    USER_ROUTE_STATE[cb.from_user.id] = route
     await cb.message.answer("پیامت رو دوباره بفرست.")
     await cb.answer()
 
 @r_priv.message(F.chat.type==ChatType.PRIVATE)
 async def private_inbox(msg: Message):
-    route = USER_ROUTE_STATE.get(msg.from_user.id)
+    route = USER_ROUTE_STATE.pop(msg.from_user.id, None)
     await db.upsert_user(msg.from_user)
     if route not in ("guard","owner"):
         return
