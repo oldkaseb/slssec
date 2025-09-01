@@ -41,29 +41,6 @@ from telegram.ext import (
     CallbackQueryHandler, ChatMemberHandler
 )
 
-
-# --- Owner-scope helpers for inline buttons (restrict glass buttons to the requester) ---
-def with_owner(data: str, owner_id: int) -> str:
-    return f"{data}|by:{owner_id}"
-
-def split_owner_tag(data: str):
-    # returns (core, owner_id or None)
-    if "|by:" in data:
-        core, tail = data.rsplit("|by:", 1)
-        try:
-            return core, int(tail)
-        except Exception:
-            return core, None
-    return data, None
-
-async def ensure_owner_or_alert(q, owner_id: int | None) -> bool:
-    if owner_id is not None and q.from_user.id != owner_id:
-        # Persian alert to match bot language
-        await q.answer("این دکمه مخصوص درخواست‌کننده‌ست.", show_alert=True)
-        return False
-    return True
-# -----------------------------------------------------------------------------
-
 # -------------------------------------------------------------------------------------
 # ENV & GLOBALS
 # -------------------------------------------------------------------------------------
@@ -328,63 +305,63 @@ async def daily_stats_for_date(date_from: datetime, date_to: datetime):
 # INLINE UI BUILDERS
 # -------------------------------------------------------------------------------------
 
-def start_menu(owner_id: int):
+def start_menu():
     kb = [
-        [InlineKeyboardButton("📨 تماس با گارد مدیران", callback_data=with_owner("contact:guard", owner_id))],
-        [InlineKeyboardButton("👑 ارتباط با مالک", callback_data=with_owner("contact:owner", owner_id))],
-        [InlineKeyboardButton("📊 آمار من", callback_data=with_owner("mystats", owner_id))]
+        [InlineKeyboardButton("📨 تماس با گارد مدیران", callback_data="contact:guard")],
+        [InlineKeyboardButton("👑 ارتباط با مالک", callback_data="contact:owner")],
+        [InlineKeyboardButton("📊 آمار من", callback_data="mystats")]
     ]
     return InlineKeyboardMarkup(kb)
 
 def contact_user_buttons(user_id: int):
     kb = [
-        [InlineKeyboardButton("💬 پاسخ", callback_data=with_owner(f"guard_reply:{user_id}", owner_id)),
+        [InlineKeyboardButton("💬 پاسخ", callback_data=f"guard_reply:{user_id}"),
          InlineKeyboardButton("⛔ مسدود", callback_data=f"block:{user_id}")]
     ]
     return InlineKeyboardMarkup(kb)
 
-def reply_again_buttons(user_id: int, owner_id: int):
-    kb = [[InlineKeyboardButton("↩️ پاسخ مجدد", callback_data=with_owner(f"guard_reply:{user_id}", owner_id))]]
+def reply_again_buttons(user_id: int):
+    kb = [[InlineKeyboardButton("↩️ پاسخ مجدد", callback_data=f"guard_reply:{user_id}")]]
     return InlineKeyboardMarkup(kb)
 
-def send_again_buttons(owner_id: int):
-    kb = [[InlineKeyboardButton("📨 ارسال مجدد", callback_data=with_owner("send_again", owner_id))]]
+def send_again_buttons():
+    kb = [[InlineKeyboardButton("📨 ارسال مجدد", callback_data="send_again")]]
     return InlineKeyboardMarkup(kb)
 
-def session_choice_buttons(owner_id: int):
-    kb = [[InlineKeyboardButton("🎙 کال", callback_data=with_owner("session:start:call", owner_id)),
-           InlineKeyboardButton("💬 چت", callback_data=with_owner("session:start:chat", owner_id))]]
+def session_choice_buttons():
+    kb = [[InlineKeyboardButton("🎙 کال", callback_data="session:start:call"),
+           InlineKeyboardButton("💬 چت", callback_data="session:start:chat")]]
     return InlineKeyboardMarkup(kb)
 
-def tag_panel(owner_id: int):
+def tag_panel():
     kb = [
-        [InlineKeyboardButton("🎙 تگ کال", callback_data=with_owner("tag:call", owner_id)),
-         InlineKeyboardButton("💬 تگ چت", callback_data=with_owner("tag:chat", owner_id))],
-        [InlineKeyboardButton("🔥 تگ اعضای فعال", callback_data=with_owner("tag:active", owner_id))],
-        [InlineKeyboardButton("👧 تگ دخترها", callback_data=with_owner("tag:female", owner_id)),
-         InlineKeyboardButton("👦 تگ پسرها", callback_data=with_owner("tag:male", owner_id))]
+        [InlineKeyboardButton("🎙 تگ کال", callback_data="tag:call"),
+         InlineKeyboardButton("💬 تگ چت", callback_data="tag:chat")],
+        [InlineKeyboardButton("🔥 تگ اعضای فعال", callback_data="tag:active")],
+        [InlineKeyboardButton("👧 تگ دخترها", callback_data="tag:female"),
+         InlineKeyboardButton("👦 تگ پسرها", callback_data="tag:male")]
     ]
     return InlineKeyboardMarkup(kb)
 
-def gender_panel(target_id: int, owner_id: int):
-    kb = [[InlineKeyboardButton("👦 پسر", callback_data=with_owner(f"gender:{target_id}:male", owner_id)),
-           InlineKeyboardButton("👧 دختر", callback_data=with_owner(f"gender:{target_id}:female", owner_id))]]
+def gender_panel(target_id: int):
+    kb = [[InlineKeyboardButton("👦 پسر", callback_data=f"gender:{target_id}:male"),
+           InlineKeyboardButton("👧 دختر", callback_data=f"gender:{target_id}:female")]]
     return InlineKeyboardMarkup(kb)
 
-def games_panel(owner_id: int):
+def games_panel():
     kb = [
-        [InlineKeyboardButton("🎯 حدس عدد (۱۰۰)", callback_data=with_owner("game:number100", owner_id))],
-        [InlineKeyboardButton("🎯 حدس عدد (۱۰۰۰)", callback_data=with_owner("game:number1000", owner_id))],
-        [InlineKeyboardButton("🧠 حدس کلمه", callback_data=with_owner("game:word", owner_id))],
-        [InlineKeyboardButton("🔤 اسکرامبل (درهم)", callback_data=with_owner("game:scramble", owner_id))],
-        [InlineKeyboardButton("⌨️ تایپ سرعتی", callback_data=with_owner("game:typing", owner_id))],
-        [InlineKeyboardButton("🧮 مسابقه حساب", callback_data=with_owner("game:math", owner_id))],
-        [InlineKeyboardButton("🧩 اسم‌رمز اموجی", callback_data=with_owner("game:emoji", owner_id))],
-        [InlineKeyboardButton("✂️ سنگ‌کاغذ‌قیچی", callback_data=with_owner("game:rps", owner_id))],
-        [InlineKeyboardButton("🎲 دایس وار", callback_data=with_owner("game:dice", owner_id))],
-        [InlineKeyboardButton("🪂 حدس حروف (هنگمن)", callback_data=with_owner("game:hangman", owner_id))],
-        [InlineKeyboardButton("📚 معما", callback_data=with_owner("game:riddle", owner_id))],
-        [InlineKeyboardButton("🔢 فرد/زوج", callback_data=with_owner("game:odd", owner_id))],
+        [InlineKeyboardButton("🎯 حدس عدد (۱۰۰)", callback_data="game:number100")],
+        [InlineKeyboardButton("🎯 حدس عدد (۱۰۰۰)", callback_data="game:number1000")],
+        [InlineKeyboardButton("🧠 حدس کلمه", callback_data="game:word")],
+        [InlineKeyboardButton("🔤 اسکرامبل (درهم)", callback_data="game:scramble")],
+        [InlineKeyboardButton("⌨️ تایپ سرعتی", callback_data="game:typing")],
+        [InlineKeyboardButton("🧮 مسابقه حساب", callback_data="game:math")],
+        [InlineKeyboardButton("🧩 اسم‌رمز اموجی", callback_data="game:emoji")],
+        [InlineKeyboardButton("✂️ سنگ‌کاغذ‌قیچی", callback_data="game:rps")],
+        [InlineKeyboardButton("🎲 دایس وار", callback_data="game:dice")],
+        [InlineKeyboardButton("🪂 حدس حروف (هنگمن)", callback_data="game:hangman")],
+        [InlineKeyboardButton("📚 معما", callback_data="game:riddle")],
+        [InlineKeyboardButton("🔢 فرد/زوج", callback_data="game:odd")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -615,16 +592,13 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.message.reply_html(
             "سلام! من ربات کمکی <b>Souls</b> هستم.\nاز منو یکی رو انتخاب کن:",
-            reply_markup=start_menu(u.id)
+            reply_markup=start_menu()
         )
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    raw = q.data
-    data, owner = split_owner_tag(raw)
-    if not await ensure_owner_or_alert(q, owner):
-        return
+    data = q.data
 
     if data.startswith("contact:"):
         mode = data.split(":",1)[1]
@@ -632,12 +606,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mode == "guard":
             await q.message.edit_text(
                 "پیامت رو همینجا بفرست. فقط اولین پیام منتقل میشه؛ برای پیام بعدی روی «ارسال مجدد» بزن.",
-                reply_markup=send_again_buttons(q.from_user.id)
+                reply_markup=send_again_buttons()
             )
         else:
             await q.message.edit_text(
                 "در ارتباط با مالک هستی. اولین پیامت منتقل میشه؛ برای پیام بعدی «ارسال مجدد».",
-                reply_markup=send_again_buttons(q.from_user.id)
+                reply_markup=send_again_buttons()
             )
         return
 
@@ -655,7 +629,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_reply_state(q.from_user.id, target, allow=True)
         await q.message.reply_html(
             f"پاسخ به <a href='tg://user?id={target}'>کاربر</a> فعال شد. یک پیام بفرست.",
-            reply_markup=reply_again_buttons(target, q.from_user.id)
+            reply_markup=reply_again_buttons(target)
         )
         return
 
@@ -732,7 +706,7 @@ async def bridge_from_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.exception(e)
 
     await after_user_sent_contact(user_id)
-    await update.message.reply_text("پیامت منتقل شد ✔️", reply_markup=send_again_buttons(q.from_user.id))
+    await update.message.reply_text("پیامت منتقل شد ✔️", reply_markup=send_again_buttons())
 
 async def guard_reply_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Listen in guard chat; if an admin has active reply_state, forward next message to target user once."""
@@ -747,7 +721,7 @@ async def guard_reply_listener(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.copy(target)
         await context.bot.send_message(target, "📩 پاسخ گارد رسید.")
         await disable_reply(admin_id)
-        await update.message.reply_text("پاسخ ارسال شد ✔️", reply_markup=reply_again_buttons(target, q.from_user.id))
+        await update.message.reply_text("پاسخ ارسال شد ✔️", reply_markup=reply_again_buttons(target))
     except Exception as e:
         log.exception(e)
 
@@ -803,7 +777,7 @@ async def on_main_group_message(update: Update, context: ContextTypes.DEFAULT_TY
         st = await active_session_type(u.id)
         if not st:
             try:
-                await msg.reply_text("حضور رو ثبت کنیم؟", reply_markup=session_choice_buttons(u.id))
+                await msg.reply_text("حضور رو ثبت کنیم؟", reply_markup=session_choice_buttons())
             except Exception:
                 pass
 
@@ -926,7 +900,7 @@ async def on_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # tag open panel
     if t.startswith("تگ") and t == "تگ":
-        await update.message.reply_text("کدوم دسته رو تگ کنم؟", reply_markup=tag_panel(u.id))
+        await update.message.reply_text("کدوم دسته رو تگ کنم؟", reply_markup=tag_panel())
         return
 
     # gender
@@ -934,12 +908,12 @@ async def on_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_manager(u.id):
             return
         target = update.message.reply_to_message.from_user.id if update.message.reply_to_message else u.id
-        await update.message.reply_text("جنسیت رو انتخاب کن:", reply_markup=gender_panel(target, u.id))
+        await update.message.reply_text("جنسیت رو انتخاب کن:", reply_markup=gender_panel(target))
         return
 
     # session manual
     if t in ("ثبت", "ثبت حضور"):
-        await update.message.reply_text("نوع فعالیت رو انتخاب کن:", reply_markup=session_choice_buttons(u.id))
+        await update.message.reply_text("نوع فعالیت رو انتخاب کن:", reply_markup=session_choice_buttons())
         return
     if t in ("ثبت خروج", "پایان"):
         await end_session_if_exists(u.id, reason="manual")
@@ -954,7 +928,7 @@ async def on_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # games
     if t == "بازی":
-        await update.message.reply_text("یک بازی انتخاب کن:", reply_markup=games_panel(u.id))
+        await update.message.reply_text("یک بازی انتخاب کن:", reply_markup=games_panel())
         return
 
     # robot (for managers)
@@ -1491,10 +1465,10 @@ def main():
     app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & ~filters.COMMAND, on_main_group_message))
 
     # Games input (works everywhere)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_command))
-
-    # Games input (works everywhere)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, games_input))
+
+    # Plain-text commands (everywhere; owner commands allowed anywhere)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_command))
 
     log.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
