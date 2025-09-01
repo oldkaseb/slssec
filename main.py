@@ -1,1030 +1,1477 @@
 
 # -*- coding: utf-8 -*-
 """
-Souls / Souls Guard Telegram Bot (single-file)
-- Framework: aiogram v3
-- DB: PostgreSQL via asyncpg
-- Hosting: Railway
-- Env Vars:
-  BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID, TZ
+Souls / Souls Guard Telegram Bot
+Single-file implementation for Railway + PostgreSQL.
 
-New in this version:
-- پشتیبانی @username در دستورات (با lookup از دیتابیس)
-- «لیست‌های سفارشی» برای افزودن/حذف/نمایش/تگ اعضا از طریق دستورات
-- حداقل ۱۰ بازی: حدس عدد x2، تایپ سرعتی، سنگ‌کاغذقیچی، ریاضی سریع، حدس کلمه، تکمیل کلمه،
-  درهم‌ریخته (anagram)، درست/نادرست، حافظه‌ی عددی
+Env vars expected in Railway:
+- BOT_TOKEN        : Telegram bot token
+- DATABASE_URL     : Postgres connection string (e.g. postgres://user:pass@host:port/dbname)
+- MAIN_CHAT_ID     : int, ID of the main group (Souls)
+- GUARD_CHAT_ID    : int, ID of the guard group (Souls Guard)
+- OWNER_ID         : int, Telegram user id of the owner
+- TZ               : e.g. Asia/Tehran (default if missing)
+
+Notes:
+- Turn OFF "Privacy mode" in BotFather to let the bot read all group messages for accurate stats.
+- Add the bot as admin in both groups (at least: read, write, pin, delete messages recommended).
+- Commands are plain-text Persian phrases (no slash).
 """
+
 import os
-import asyncio
 import re
+import json
+import math
+import asyncio
+import logging
 import random
-import string
-from datetime import datetime, timedelta, timezone, date
-from typing import Dict, Optional, Tuple, List, Any
+from datetime import datetime, timedelta, timezone
 
+import pytz
+import jdatetime
 import asyncpg
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-                           ChatMemberUpdated)
-from aiogram.filters import CommandStart
-from aiogram.enums import ChatType, ParseMode
-from aiogram.client.default import DefaultBotProperties
 
-# Persian (Jalali) date
-try:
-    import jdatetime
-except Exception:
-    jdatetime = None
-
-# ---------- ENV & GLOBALS ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
-MAIN_CHAT_ID = int(os.getenv("MAIN_CHAT_ID", "0"))
-GUARD_CHAT_ID = int(os.getenv("GUARD_CHAT_ID", "0"))
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-TZ = os.getenv("TZ", "Asia/Tehran")
-
-if not BOT_TOKEN or not DATABASE_URL or not MAIN_CHAT_ID or not GUARD_CHAT_ID or not OWNER_ID:
-    raise SystemExit("Please set BOT_TOKEN, DATABASE_URL, MAIN_CHAT_ID, GUARD_CHAT_ID, OWNER_ID")
-
-ADMIN_REPLY_STATE: Dict[int, int] = {}
-USER_ROUTE_STATE: Dict[int, str] = {}
-USER_LAST_ROUTE: Dict[int, str] = {}
-SESSION_IDLE_TASKS: Dict[int, asyncio.Task] = {}
-GAME_STATE: Dict[int, Dict[str, Any]] = {}
-
-ROLE_ORDER = ["owner","lead_all","lead_chat","lead_call","admin_chat","admin_call"]
-MENTION_CHUNK = 5
-
-# ---------- UTILS ----------
-def now_tehran() -> datetime:
-    return datetime.utcnow().replace(tzinfo=timezone.utc)
-
-def fmt_jalali(d: date) -> str:
-    try:
-        if jdatetime:
-            j = jdatetime.date.fromgregorian(date=d)
-            weekdays = ["دوشنبه","سه‌شنبه","چهارشنبه","پنجشنبه","جمعه","شنبه","یکشنبه"]
-            return f"{j.strftime('%Y/%m/%d')} - {weekdays[j.weekday() % 7]}"
-    except Exception:
-        pass
-    return d.isoformat()
-
-def mention_html(user_id: int, name: str) -> str:
-    safe = (name or "کاربر").replace("<","").replace(">","")
-    return f"<a href=\"tg://user?id={user_id}\">{safe}</a>"
-
-def chunks(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-# ---------- DB LAYER ----------
-class DB:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-        self.pool: Optional[asyncpg.pool.Pool] = None
-
-    async def connect(self):
-        self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=10)
-        await self.init_schema()
-
-    async def init_schema(self):
-        async with self.pool.acquire() as con:
-            await con.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                first_name TEXT,
-                last_name TEXT,
-                username TEXT,
-                username_lc TEXT,
-                gender TEXT,
-                is_banned BOOLEAN DEFAULT FALSE,
-                last_active TIMESTAMP WITH TIME ZONE,
-                joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            );
-            -- migrate-safe: ensure new columns exist even if users table was created in older versions
-            ALTER TABLE IF EXISTS users
-                ADD COLUMN IF NOT EXISTS first_name TEXT,
-                ADD COLUMN IF NOT EXISTS last_name TEXT,
-                ADD COLUMN IF NOT EXISTS username TEXT,
-                ADD COLUMN IF NOT EXISTS username_lc TEXT,
-                ADD COLUMN IF NOT EXISTS gender TEXT,
-                ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE,
-                ADD COLUMN IF NOT EXISTS last_active TIMESTAMP WITH TIME ZONE,
-                ADD COLUMN IF NOT EXISTS joined_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
-            CREATE UNIQUE INDEX IF NOT EXISTS users_username_lc_idx ON users(username_lc) WHERE username_lc IS NOT NULL;
-
-            CREATE TABLE IF NOT EXISTS roles (
-                user_id BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
-                role TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS bans (
-                user_id BIGINT PRIMARY KEY,
-                reason TEXT,
-                banned_by BIGINT,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                kind TEXT NOT NULL, -- chat|call
-                start_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                end_at TIMESTAMP WITH TIME ZONE,
-                last_msg_at TIMESTAMP WITH TIME ZONE
-            );
-            CREATE INDEX IF NOT EXISTS idx_sessions_open ON sessions(user_id) WHERE end_at IS NULL;
-
-            CREATE TABLE IF NOT EXISTS daily_stats (
-                day DATE NOT NULL,
-                user_id BIGINT NOT NULL,
-                chat_msgs INT DEFAULT 0,
-                mentions INT DEFAULT 0,
-                call_minutes INT DEFAULT 0,
-                PRIMARY KEY (day, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            );
-
-            -- Named lists for full DB control
-            CREATE TABLE IF NOT EXISTS named_lists (
-                name TEXT PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS list_members (
-                name TEXT REFERENCES named_lists(name) ON DELETE CASCADE,
-                user_id BIGINT NOT NULL,
-                PRIMARY KEY (name, user_id)
-            );
-            """)
-
-    async def upsert_user(self, u):
-        async with self.pool.acquire() as con:
-            await con.execute("""
-                INSERT INTO users (user_id, first_name, last_name, username, username_lc, last_active)
-                VALUES ($1,$2,$3,$4,LOWER($4),NOW())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    first_name=EXCLUDED.first_name,
-                    last_name=EXCLUDED.last_name,
-                    username=EXCLUDED.username,
-                    username_lc=EXCLUDED.username_lc,
-                    last_active=NOW();
-            """, u.id, u.first_name, u.last_name, u.username)
-
-    async def ensure_user_id(self, user_id: int):
-        async with self.pool.acquire() as con:
-            await con.execute("INSERT INTO users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-
-    async def get_user_id_by_username(self, username: str) -> Optional[int]:
-        async with self.pool.acquire() as con:
-            return await con.fetchval("SELECT user_id FROM users WHERE username_lc=$1", username.lower())
-
-    async def set_gender(self, user_id: int, gender: str):
-        async with self.pool.acquire() as con:
-            await con.execute("UPDATE users SET gender=$2 WHERE user_id=$1", user_id, gender)
-
-    async def get_role(self, user_id: int) -> Optional[str]:
-        async with self.pool.acquire() as con:
-            return await con.fetchval("SELECT role FROM roles WHERE user_id=$1", user_id)
-
-    async def set_role(self, user_id: int, role: Optional[str]):
-        async with self.pool.acquire() as con:
-            if role:
-                await con.execute("""
-                    INSERT INTO roles (user_id, role) VALUES ($1,$2)
-                    ON CONFLICT (user_id) DO UPDATE SET role=EXCLUDED.role
-                """, user_id, role)
-            else:
-                await con.execute("DELETE FROM roles WHERE user_id=$1", user_id)
-
-    async def list_by_roles(self, roles: List[str]) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("""
-                SELECT u.user_id, u.first_name, u.last_name, u.username, r.role
-                FROM roles r JOIN users u ON u.user_id=r.user_id
-                WHERE r.role = ANY($1::text[])
-                ORDER BY ARRAY_POSITION($1::text[], r.role), u.first_name
-            """, roles)
-            return list(rows)
-
-    async def record_message(self, user_id: int, is_mention: bool):
-        async with self.pool.acquire() as con:
-            await con.execute("UPDATE users SET last_active=NOW() WHERE user_id=$1", user_id)
-            await con.execute("""
-                INSERT INTO daily_stats (day, user_id, chat_msgs, mentions)
-                VALUES (CURRENT_DATE, $1, 1, $2)
-                ON CONFLICT (day, user_id) DO UPDATE SET
-                    chat_msgs = daily_stats.chat_msgs + 1,
-                    mentions = daily_stats.mentions + $2
-            """, user_id, 1 if is_mention else 0)
-
-    async def open_session(self, user_id: int, kind: str):
-        async with self.pool.acquire() as con:
-            await con.execute("INSERT INTO sessions (user_id, kind, start_at, last_msg_at) VALUES ($1,$2,NOW(),NOW())", user_id, kind)
-
-    async def has_open_session(self, user_id: int) -> bool:
-        async with self.pool.acquire() as con:
-            v = await con.fetchval("SELECT 1 FROM sessions WHERE user_id=$1 AND end_at IS NULL", user_id)
-            return bool(v)
-
-    async def touch_session(self, user_id: int):
-        async with self.pool.acquire() as con:
-            await con.execute("UPDATE sessions SET last_msg_at=NOW() WHERE user_id=$1 AND end_at IS NULL", user_id)
-
-    async def close_open_session(self, user_id: int):
-        async with self.pool.acquire() as con:
-            await con.execute("UPDATE sessions SET end_at=NOW() WHERE user_id=$1 AND end_at IS NULL", user_id)
-
-    async def auto_close_idle_sessions(self, idle_minutes: int = 5) -> List[int]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("""
-                UPDATE sessions s SET end_at=NOW()
-                WHERE s.end_at IS NULL AND s.last_msg_at < NOW() - ($1 || ' minutes')::interval
-                RETURNING s.user_id
-            """, idle_minutes)
-            return [r["user_id"] for r in rows]
-
-    async def sum_call_minutes_for_day(self, d: date) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("""
-                SELECT user_id,
-                       SUM(EXTRACT(EPOCH FROM (end_at - start_at))/60) AS mins
-                FROM sessions
-                WHERE end_at IS NOT NULL AND DATE(end_at AT TIME ZONE 'UTC')=$1 AND kind='call'
-                GROUP BY user_id
-            """, d)
-            return list(rows)
-
-    async def upsert_call_minutes(self, d: date, user_id: int, minutes: int):
-        async with self.pool.acquire() as con:
-            await con.execute("""
-                INSERT INTO daily_stats (day, user_id, call_minutes) VALUES ($1,$2,$3)
-                ON CONFLICT (day, user_id) DO UPDATE SET call_minutes=$3
-            """, d, user_id, minutes)
-
-    async def get_stats_last7(self, user_id: int) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("""
-                SELECT day, chat_msgs, mentions, call_minutes
-                FROM daily_stats
-                WHERE user_id=$1 AND day >= CURRENT_DATE - INTERVAL '6 days'
-                ORDER BY day
-            """, user_id)
-            return list(rows)
-
-    async def list_active_members(self, minutes: int = 120) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("""
-                SELECT user_id, first_name, last_name, username
-                FROM users
-                WHERE last_active > NOW() - ($1 || ' minutes')::interval AND COALESCE(is_banned,false)=false
-            """, minutes)
-            return list(rows)
-
-    async def by_gender(self, gender: str) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("SELECT user_id, first_name, last_name FROM users WHERE gender=$1", gender)
-            return list(rows)
-
-    async def add_ban(self, target_id: int, by: int, reason: str = None):
-        async with self.pool.acquire() as con:
-            await con.execute("""
-                INSERT INTO bans (user_id, reason, banned_by) VALUES ($1,$2,$3)
-                ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_by=EXCLUDED.banned_by, created_at=NOW();
-                UPDATE users SET is_banned=TRUE WHERE user_id=$1;
-            """, target_id, reason, by)
-
-    async def remove_ban(self, target_id: int):
-        async with self.pool.acquire() as con:
-            await con.execute("""
-                DELETE FROM bans WHERE user_id=$1;
-                UPDATE users SET is_banned=FALSE WHERE user_id=$1;
-            """, target_id)
-
-    async def list_bans(self) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("""
-                SELECT b.user_id, u.first_name, u.last_name FROM bans b LEFT JOIN users u ON u.user_id=b.user_id
-                ORDER BY b.created_at DESC
-            """)
-            return list(rows)
-
-    # named lists
-    async def create_list(self, name: str):
-        async with self.pool.acquire() as con:
-            await con.execute("INSERT INTO named_lists (name) VALUES ($1) ON CONFLICT DO NOTHING", name)
-
-    async def delete_list(self, name: str):
-        async with self.pool.acquire() as con:
-            await con.execute("DELETE FROM named_lists WHERE name=$1", name)
-
-    async def add_to_list(self, name: str, user_id: int):
-        async with self.pool.acquire() as con:
-            await con.execute("INSERT INTO named_lists (name) VALUES ($1) ON CONFLICT DO NOTHING", name)
-            await con.execute("INSERT INTO list_members (name, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", name, user_id)
-
-    async def remove_from_list(self, name: str, user_id: int):
-        async with self.pool.acquire() as con:
-            await con.execute("DELETE FROM list_members WHERE name=$1 AND user_id=$2", name, user_id)
-
-    async def members_of_list(self, name: str) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as con:
-            rows = await con.fetch("""
-                SELECT u.user_id, u.first_name, u.last_name
-                FROM list_members m LEFT JOIN users u ON u.user_id=m.user_id
-                WHERE m.name=$1
-            """, name)
-            return list(rows)
-
-    async def set_config(self, key: str, val: str):
-        async with self.pool.acquire() as con:
-            await con.execute("""
-                INSERT INTO config (key, value) VALUES ($1,$2)
-                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
-            """, key, val)
-
-    async def get_config(self, key: str, default: str = "") -> str:
-        async with self.pool.acquire() as con:
-            v = await con.fetchval("SELECT value FROM config WHERE key=$1", key)
-            return v if v is not None else default
-
-# ---------- BOT ----------
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-r_priv = Router()
-r_grp = Router()
-dp.include_router(r_priv)
-dp.include_router(r_grp)
-
-db = DB(DATABASE_URL)
-
-# ---------- START / PRIVATE PANEL ----------
-def main_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📨 تماس با گارد مدیران", callback_data="pm_guard")],
-        [InlineKeyboardButton(text="👑 ارتباط با مالک", callback_data="pm_owner")],
-        [InlineKeyboardButton(text="📊 آمار من", callback_data="my_stats")]
-    ])
-
-@r_priv.message(CommandStart(), F.chat.type==ChatType.PRIVATE)
-async def start_cmd(msg: Message):
-    await db.upsert_user(msg.from_user)
-    await msg.answer("سلام! به ربات سولز خوش اومدی.\nاز دکمه‌های زیر استفاده کن 👇", reply_markup=main_menu_kb())
-
-@r_priv.callback_query(F.data.in_(["pm_guard","pm_owner"]))
-async def pm_route(cb: CallbackQuery):
-    route = "guard" if cb.data=="pm_guard" else "owner"
-    USER_ROUTE_STATE[cb.from_user.id] = route
-    USER_LAST_ROUTE[cb.from_user.id] = route
-    await db.upsert_user(cb.from_user)
-    await cb.message.answer("پیامت رو بفرست؛ هر نوع پیامی مجازه. بعد از ارسال، می‌تونی «ارسال مجدد» بزنی.")
-    await cb.answer()
-
-def resend_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➕ ارسال مجدد", callback_data="resend")],
-                                                 [InlineKeyboardButton(text="⬅️ بازگشت", callback_data="back_menu")]])
-
-def reply_block_kb(target_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✉️ پاسخ", callback_data=f"reply:{target_id}"),
-        InlineKeyboardButton(text="⛔ مسدود", callback_data=f"block:{target_id}")
-    ]])
-
-@r_priv.callback_query(F.data=="back_menu")
-async def back_menu(cb: CallbackQuery):
-    await cb.message.edit_text("منو:", reply_markup=main_menu_kb())
-    await cb.answer()
-
-@r_priv.callback_query(F.data=="resend")
-async def resend(cb: CallbackQuery):
-    route = USER_LAST_ROUTE.get(cb.from_user.id, "guard")
-    USER_ROUTE_STATE[cb.from_user.id] = route
-    await cb.message.answer("پیامت رو دوباره بفرست.")
-    await cb.answer()
-
-@r_priv.message(F.chat.type==ChatType.PRIVATE)
-async def private_inbox(msg: Message):
-    route = USER_ROUTE_STATE.pop(msg.from_user.id, None)
-    await db.upsert_user(msg.from_user)
-    if route not in ("guard","owner"):
-        return
-    target_chat = GUARD_CHAT_ID if route=="guard" else OWNER_ID
-    try:
-        await msg.copy_to(target_chat)
-        caption = f"پیام جدید از {mention_html(msg.from_user.id, msg.from_user.full_name)}"
-        await bot.send_message(target_chat, caption, reply_markup=reply_block_kb(msg.from_user.id))
-    except Exception:
-        await msg.answer("ارسال پیام به مقصد ناموفق بود.")
-        return
-    await msg.answer("پیام ارسال شد ✅", reply_markup=resend_kb())
-
-# ---------- ADMIN REPLY ----------
-@r_grp.callback_query(F.data.startswith("reply:"))
-async def reply_btn(cb: CallbackQuery):
-    ADMIN_REPLY_STATE[cb.from_user.id] = int(cb.data.split(":")[1])
-    await db.upsert_user(cb.from_user)
-    await cb.message.reply("پیامت رو برای کاربر ارسال کن. (فقط اولین پیام ارسال می‌شود)",
-                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="لغو", callback_data="cancel_reply")]]))
-    await cb.answer()
-
-@r_grp.callback_query(F.data=="cancel_reply")
-async def cancel_reply(cb: CallbackQuery):
-    ADMIN_REPLY_STATE.pop(cb.from_user.id, None)
-    await cb.message.edit_text("لغو شد.")
-    await cb.answer()
-
-@r_grp.callback_query(F.data.startswith("block:"))
-async def block_btn(cb: CallbackQuery):
-    target_id = int(cb.data.split(":")[1])
-    role = await db.get_role(cb.from_user.id)
-    if cb.from_user.id!=OWNER_ID and role not in ("lead_all","lead_chat","lead_call","admin_chat","admin_call"):
-        await cb.answer("اجازه ندارید.", show_alert=True); return
-    await db.add_ban(target_id, cb.from_user.id, reason="panel_block")
-    for cid in (MAIN_CHAT_ID, GUARD_CHAT_ID):
-        try: await bot.ban_chat_member(cid, target_id)
-        except Exception: pass
-    await cb.message.reply(f"کاربر {target_id} مسدود شد.")
-    await cb.answer("مسدود شد.")
-
-@r_grp.message(F.chat.id==GUARD_CHAT_ID)
-async def admin_reply_pipe(msg: Message):
-    target = ADMIN_REPLY_STATE.pop(msg.from_user.id, None)
-    if target:
-        try:
-            await msg.copy_to(target)
-            await msg.reply("ارسال شد ✅", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="پاسخ مجدد", callback_data=f"reply:{target}")]]))
-            await bot.send_message(target, "پاسخ مدیران رسید ✅", reply_markup=main_menu_kb())
-        except Exception:
-            await msg.reply("خطا در ارسال پاسخ.")
-
-# ---------- PARSE TARGET (reply / id / @username) ----------
-async def parse_target_from_message(msg: Message) -> Optional[int]:
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        return msg.reply_to_message.from_user.id
-    text = (msg.text or msg.caption or "").strip()
-    # numeric id
-    m = re.search(r'(\d{6,})', text)
-    if m:
-        try: return int(m.group(1))
-        except: pass
-    # @username
-    um = re.search(r'@([A-Za-z0-9_]{5,})', text)
-    if um:
-        uid = await db.get_user_id_by_username(um.group(1))
-        if uid: return uid
-    return None
-
-# ---------- GROUP MONITOR (main) ----------
-@r_grp.message(F.chat.id==MAIN_CHAT_ID)
-async def main_group_listener(msg: Message):
-    if not msg.from_user or msg.from_user.is_bot: return
-    await db.upsert_user(msg.from_user)
-    # stats
-    is_mention = False
-    if msg.entities:
-        for e in msg.entities:
-            if e.type in ("mention","text_mention"):
-                is_mention = True; break
-    await db.record_message(msg.from_user.id, is_mention)
-
-    role = await db.get_role(msg.from_user.id)
-    if role in ("admin_chat","admin_call","lead_chat","lead_call","lead_all") or msg.from_user.id==OWNER_ID:
-        if not await db.has_open_session(msg.from_user.id):
-            await msg.reply("مدیر عزیز، نوع فعالیتت رو ثبت کن:", reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🟢 ثبت فعالیت چت", callback_data="session:chat")],
-                                 [InlineKeyboardButton(text="🔵 ثبت فعالیت کال", callback_data="session:call")]]))
-        else:
-            await db.touch_session(msg.from_user.id)
-            t = SESSION_IDLE_TASKS.get(msg.from_user.id)
-            if t and not t.cancelled(): t.cancel()
-            SESSION_IDLE_TASKS[msg.from_user.id] = asyncio.create_task(schedule_idle_close(msg.from_user.id, 5))
-
-async def schedule_idle_close(user_id: int, minutes: int):
-    try: await asyncio.sleep(minutes*60)
-    except asyncio.CancelledError: return
-    if await db.has_open_session(user_id):
-        await db.close_open_session(user_id)
-        try: await bot.send_message(GUARD_CHAT_ID, f"🔴 پایان خودکار فعالیت {user_id} به دلیل عدم فعالیت ۵ دقیقه‌ای")
-        except Exception: pass
-
-@r_grp.callback_query(F.data.startswith("session:"))
-async def session_buttons(cb: CallbackQuery):
-    kind = cb.data.split(":")[1]
-    role = await db.get_role(cb.from_user.id)
-    if role not in ("admin_chat","admin_call","lead_chat","lead_call","lead_all") and cb.from_user.id!=OWNER_ID:
-        await cb.answer("فقط مدیران می‌توانند ثبت کنند.", show_alert=True); return
-    if await db.has_open_session(cb.from_user.id):
-        await cb.answer("سشن باز دارید.", show_alert=True); return
-    await db.open_session(cb.from_user.id, kind)
-    await cb.message.reply(f"✅ شروع فعالیت {mention_html(cb.from_user.id, cb.from_user.full_name)} ({'چت' if kind=='chat' else 'کال'})")
-    try: await bot.send_message(GUARD_CHAT_ID, f"✅ شروع فعالیت {mention_html(cb.from_user.id, cb.from_user.full_name)} - نوع: {'چت' if kind=='chat' else 'کال'}")
-    except Exception: pass
-    SESSION_IDLE_TASKS[cb.from_user.id] = asyncio.create_task(schedule_idle_close(cb.from_user.id, 5))
-    await cb.answer("ثبت شد.")
-
-@r_grp.message(F.text.regexp("^ثبت خروج$"), F.chat.id==MAIN_CHAT_ID)
-async def end_session_text(msg: Message):
-    if await db.has_open_session(msg.from_user.id):
-        await db.close_open_session(msg.from_user.id)
-        await msg.reply("پایان فعالیت شما گزارش شد. خسته نباشید 🤍")
-        try: await bot.send_message(GUARD_CHAT_ID, f"🔻 پایان فعالیت {mention_html(msg.from_user.id, msg.from_user.full_name)}")
-        except Exception: pass
-    else:
-        await msg.reply("سشن بازی ندارید.")
-
-@r_grp.message(F.text.regexp("^ثبت$"), F.chat.id==MAIN_CHAT_ID)
-async def popup_register(msg: Message):
-    await msg.reply("نوع فعالیت را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🟢 ثبت فعالیت چت", callback_data="session:chat")],
-                         [InlineKeyboardButton(text="🔵 ثبت فعالیت کال", callback_data="session:call")]]))
-
-# ---------- MANAGEMENT ----------
-def only_privileged(uid: int, role: Optional[str]) -> bool:
-    return uid==OWNER_ID or (role in ("lead_all","lead_chat","lead_call","admin_chat","admin_call"))
-
-@r_grp.message(F.text.regexp("^ممنوع"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def ban_cmd(msg: Message):
-    role = await db.get_role(msg.from_user.id)
-    if not only_privileged(msg.from_user.id, role): return
-    target = await parse_target_from_message(msg)
-    if not target: await msg.reply("ریپلای/آیدی/@username لازم است."); return
-    await db.add_ban(target, msg.from_user.id, reason="manual_ban")
-    for cid in (MAIN_CHAT_ID, GUARD_CHAT_ID):
-        try: await bot.ban_chat_member(cid, target)
-        except Exception: pass
-    await msg.reply(f"کاربر {target} ممنوع شد.")
-
-@r_grp.message(F.text.regexp("^آزاد"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def unban_cmd(msg: Message):
-    role = await db.get_role(msg.from_user.id)
-    if not only_privileged(msg.from_user.id, role): return
-    target = await parse_target_from_message(msg)
-    if not target: await msg.reply("ریپلای/آیدی/@username لازم است."); return
-    await db.remove_ban(target)
-    for cid in (MAIN_CHAT_ID, GUARD_CHAT_ID):
-        try: await bot.unban_chat_member(cid, target, only_if_banned=True)
-        except Exception: pass
-    await msg.reply(f"کاربر {target} آزاد شد.")
-
-@r_grp.message(F.text.regexp("^لیست ممنوع"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_banned(msg: Message):
-    rows = await db.list_bans()
-    if not rows: await msg.reply("لیست ممنوع خالی است."); return
-    lines = [f"• {mention_html(r['user_id'], ((r['first_name'] or '') + ' ' + (r['last_name'] or '')).strip() or str(r['user_id']))}" for r in rows]
-    await msg.reply("\n".join(lines), disable_web_page_preview=True)
-
-PROMO_MAP = {
-    "ترفیع چت": "admin_chat",
-    "ترفیع کال": "admin_call",
-    "ترفیع ارشد چت": "lead_chat",
-    "ترفیع ارشد کال": "lead_call",
-    "ترفیع ارشد کل": "lead_all",
-}
-DEMOTE_KEYS = ["عزل چت","عزل کال","عزل ارشد چت","عزل ارشد کال","عزل ارشد کل"]
-
-@r_grp.message(F.text.func(lambda t: any(t.startswith(k) for k in PROMO_MAP.keys())), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def promote_cmd(msg: Message):
-    if msg.from_user.id != OWNER_ID: return
-    target = await parse_target_from_message(msg)
-    if not target: await msg.reply("ریپلای/آیدی/@username لازم است."); return
-    role = next(v for k,v in PROMO_MAP.items() if msg.text.startswith(k))
-    await db.ensure_user_id(target)
-    await db.set_role(target, role)
-    await msg.reply(f"سمت {target} → {role} ثبت شد.")
-
-@r_grp.message(F.text.func(lambda t: any(t.startswith(k) for k in DEMOTE_KEYS)), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def demote_cmd(msg: Message):
-    if msg.from_user.id != OWNER_ID: return
-    target = await parse_target_from_message(msg)
-    if not target: await msg.reply("ریپلای/آیدی/@username لازم است."); return
-    await db.set_role(target, None)
-    await msg.reply(f"سمت {target} حذف شد.")
-
-@r_grp.message(F.text.regexp("^لیست گارد"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_guard(msg: Message):
-    rows = await db.list_by_roles(ROLE_ORDER)
-    if not rows: await msg.reply("لیستی موجود نیست."); return
-    lines = []
-    for r in rows:
-        name = ((r['first_name'] or '') + ' ' + (r['last_name'] or '')).strip() or str(r['user_id'])
-        lines.append(f"• {r['role']}: {mention_html(r['user_id'], name)}")
-    await msg.reply("\n".join(lines), disable_web_page_preview=True)
-
-@r_grp.message(F.text.regexp("^آیدی"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def id_stats(msg: Message):
-    target = await parse_target_from_message(msg) or msg.from_user.id
-    rows = await db.get_stats_last7(target)
-    if not rows: await msg.reply("آماری موجود نیست."); return
-    lines = [f"آمار ۷ روز گذشته {target}"]
-    for r in rows:
-        d = r["day"]; d = d if isinstance(d, date) else r["day"].date()
-        lines.append(f"{fmt_jalali(d)}: پیام‌ها {r['chat_msgs']} | منشن {r['mentions']} | کال {int(r['call_minutes'])} دقیقه")
-    try:
-        photos = await bot.get_user_profile_photos(target, limit=1)
-        if photos.total_count>0:
-            fid = photos.photos[0][-1].file_id
-            await bot.send_photo(msg.chat.id, fid, caption="\n".join(lines)); return
-    except Exception: pass
-    await msg.reply("\n".join(lines))
-
-# ---------- TAG PANEL & GENDER ----------
-def tag_panel_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📣 تگ کال", callback_data="tag:call"),
-         InlineKeyboardButton(text="💬 تگ چت", callback_data="tag:chat")],
-        [InlineKeyboardButton(text="🔥 تگ اعضای فعال", callback_data="tag:active")],
-        [InlineKeyboardButton(text="👧 تگ دخترها", callback_data="tag:girls"),
-         InlineKeyboardButton(text="👦 تگ پسرها", callback_data="tag:boys")],
-        [InlineKeyboardButton(text="🗂 تگ لیست سفارشی", callback_data="tag:list")]
-    ])
-
-@r_grp.message(F.text.regexp("^تگ$"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def tag_cmd(msg: Message):
-    await msg.reply("یکی را انتخاب کن:", reply_markup=tag_panel_kb())
-
-@r_grp.callback_query(F.data.startswith("tag:"))
-async def tag_actions(cb: CallbackQuery):
-    t = cb.data.split(":")[1]
-    if t in ("call","chat"):
-        roles = ["admin_call","lead_call","lead_all","owner"] if t=="call" else ["admin_chat","lead_chat","lead_all","owner"]
-        rows = await db.list_by_roles(roles)
-        mentions = [mention_html(r["user_id"], ((r["first_name"] or "") + " " + (r["last_name"] or "")).strip()) for r in rows]
-        await send_mentions(cb.message, mentions)
-    elif t=="active":
-        rows = await db.list_active_members(240)
-        mentions = [mention_html(r["user_id"], ((r["first_name"] or "") + " " + (r["last_name"] or "")).strip()) for r in rows]
-        await send_mentions(cb.message, mentions)
-    elif t=="girls":
-        rows = await db.by_gender("girl")
-        mentions = [mention_html(r["user_id"], ((r["first_name"] or "") + " " + (r["last_name"] or "")).strip()) for r in rows]
-        await send_mentions(cb.message, mentions)
-    elif t=="boys":
-        rows = await db.by_gender("boy")
-        mentions = [mention_html(r["user_id"], ((r["first_name"] or "") + " " + (r["last_name"] or "")).strip()) for r in rows]
-        await send_mentions(cb.message, mentions)
-    elif t=="list":
-        await cb.message.reply("نام لیست را با دستور «تگ لیست <name>» بفرستید.")
-    await cb.answer()
-
-async def send_mentions(message: Message, mentions: List[str]):
-    if not mentions:
-        await message.reply("کسی یافت نشد."); return
-    for g in chunks(mentions, MENTION_CHUNK):
-        await asyncio.sleep(0.5); await message.reply(" ".join(g), disable_web_page_preview=True)
-
-def gender_kb(target_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="👦 پسر", callback_data=f"gender:boy:{target_id}"),
-        InlineKeyboardButton(text="👧 دختر", callback_data=f"gender:girl:{target_id}")
-    ]])
-
-@r_grp.message(F.text.regexp("^جنسیت"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def gender_cmd(msg: Message):
-    role = await db.get_role(msg.from_user.id)
-    if not only_privileged(msg.from_user.id, role): return
-    target = await parse_target_from_message(msg) or msg.from_user.id
-    await msg.reply("جنسیت را انتخاب کنید:", reply_markup=gender_kb(target))
-
-@r_grp.callback_query(F.data.startswith("gender:"))
-async def gender_set(cb: CallbackQuery):
-    _, g, tid = cb.data.split(":"); tid = int(tid)
-    await db.set_gender(tid, "boy" if g=="boy" else "girl")
-    await cb.message.reply(f"جنسیت کاربر {tid} ثبت شد."); await cb.answer("OK")
-
-# ---------- CUSTOM LISTS (full DB control) ----------
-def parse_after_keyword(text: str, key: str) -> str:
-    return text[len(key):].strip()
-
-@r_grp.message(F.text.regexp("^لیست ساخت "), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_create(msg: Message):
-    if msg.from_user.id!=OWNER_ID: return
-    name = parse_after_keyword(msg.text, "لیست ساخت")
-    if not name: await msg.reply("نام لیست؟"); return
-    await db.create_list(name); await msg.reply(f"لیست «{name}» ساخته شد.")
-
-@r_grp.message(F.text.regexp("^لیست حذف "), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_delete(msg: Message):
-    if msg.from_user.id!=OWNER_ID: return
-    name = parse_after_keyword(msg.text, "لیست حذف")
-    if not name: await msg.reply("نام لیست؟"); return
-    await db.delete_list(name); await msg.reply(f"لیست «{name}» حذف شد.")
-
-@r_grp.message(F.text.regexp("^لیست افزودن "), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_add_member(msg: Message):
-    role = await db.get_role(msg.from_user.id)
-    if not only_privileged(msg.from_user.id, role): return
-    name = parse_after_keyword(msg.text, "لیست افزودن")
-    target = await parse_target_from_message(msg)
-    if not name or not target: await msg.reply("فرمت: «لیست افزودن <name>» + ریپلای/آیدی/@username"); return
-    await db.ensure_user_id(target); await db.add_to_list(name, target)
-    await msg.reply(f"به «{name}» اضافه شد: {target}")
-
-@r_grp.message(F.text.regexp("^لیست کم "), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_remove_member(msg: Message):
-    role = await db.get_role(msg.from_user.id)
-    if not only_privileged(msg.from_user.id, role): return
-    name = parse_after_keyword(msg.text, "لیست کم")
-    target = await parse_target_from_message(msg)
-    if not name or not target: await msg.reply("فرمت: «لیست کم <name>» + ریپلای/آیدی/@username"); return
-    await db.remove_from_list(name, target); await msg.reply(f"از «{name}» حذف شد: {target}")
-
-@r_grp.message(F.text.regexp("^لیست نشان "), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_show(msg: Message):
-    name = parse_after_keyword(msg.text, "لیست نشان")
-    rows = await db.members_of_list(name)
-    if not rows: await msg.reply("لیست خالی/ناموجود."); return
-    mentions = [mention_html(r["user_id"], ((r["first_name"] or "") + " " + (r["last_name"] or "")).strip() or str(r["user_id"])) for r in rows]
-    await msg.reply("\n".join(mentions), disable_web_page_preview=True)
-
-@r_grp.message(F.text.regexp("^تگ لیست "), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def list_tag(msg: Message):
-    name = parse_after_keyword(msg.text, "تگ لیست")
-    rows = await db.members_of_list(name)
-    mentions = [mention_html(r["user_id"], ((r["first_name"] or "") + " " + (r["last_name"] or "")).strip() or str(r["user_id"])) for r in rows]
-    await send_mentions(msg, mentions)
-
-# ---------- HELP ----------
-HELP_TEXT = (
-"راهنمای ربات:\n"
-"• ثبت حضور: «ثبت» یا دکمه‌ها. پایان: «ثبت خروج».\n"
-"• مدیریت: «ممنوع/آزاد»، ترفیع/عزل، «لیست گارد»، «لیست ممنوع»، «جنسیت».\n"
-"• لیست‌های سفارشی: «لیست ساخت <name>»، «لیست حذف <name>»، «لیست افزودن <name>»، «لیست کم <name>»، «لیست نشان <name>»، «تگ لیست <name>».\n"
-"• آمار: «آیدی» (خود/هدف) – ۷ روز گذشته.\n"
-"• تگ: پنل «تگ».\n"
-"• بازی: «بازی» و یکی از آیتم‌ها.\n"
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+    InputMediaVideo, InputMediaAudio, InputMediaDocument
+)
+from telegram.constants import ParseMode, ChatType
+from telegram.ext import (
+    ApplicationBuilder, ContextTypes, MessageHandler, filters,
+    CallbackQueryHandler, ChatMemberHandler
 )
 
-@r_grp.message(F.text.regexp("^راهنما"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def help_cmd(msg: Message):
-    await msg.reply(HELP_TEXT)
+# -------------------------------------------------------------------------------------
+# ENV & GLOBALS
+# -------------------------------------------------------------------------------------
 
-# ---------- FUN (random tag toggle) ----------
-RANDOM_TAG_PHRASES = [f"جمله انگیزشی {i}" for i in range(1,201)] + [
-"سولز بدون تو یه چیزیش کمه!", "یک سلام گرم بده 😄", "بیا که کار داریم!", "وقت درخشیدنه ✨"
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+MAIN_CHAT_ID = int(os.environ.get("MAIN_CHAT_ID", "0"))
+GUARD_CHAT_ID= int(os.environ.get("GUARD_CHAT_ID", "0"))
+OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
+TZ_NAME      = os.environ.get("TZ", "Asia/Tehran")
+
+TEHRAN_TZ = pytz.timezone(TZ_NAME)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+log = logging.getLogger("souls-bot")
+
+# -------------------------------------------------------------------------------------
+# DB
+# -------------------------------------------------------------------------------------
+
+POOL: asyncpg.Pool | None = None
+
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+  user_id BIGINT PRIMARY KEY,
+  username TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  gender TEXT DEFAULT 'unknown',
+  joined_at TIMESTAMPTZ,
+  last_seen TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS roles (
+  user_id BIGINT,
+  role TEXT,
+  PRIMARY KEY (user_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS bans (
+  user_id BIGINT PRIMARY KEY,
+  added_by BIGINT,
+  reason TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT,
+  session_type TEXT, -- 'chat' | 'call'
+  start_ts TIMESTAMPTZ,
+  end_ts TIMESTAMPTZ,
+  end_reason TEXT,
+  active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT,
+  chat_id BIGINT,
+  ts TIMESTAMPTZ,
+  text TEXT,
+  mention_count INT DEFAULT 0,
+  has_media BOOLEAN DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS toggles (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS contact_state (
+  user_id BIGINT PRIMARY KEY,
+  mode TEXT,           -- 'guard' | 'owner'
+  can_send BOOLEAN,
+  updated_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS reply_state (
+  admin_id BIGINT PRIMARY KEY,
+  target_user BIGINT,
+  can_send BOOLEAN,
+  updated_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS games (
+  user_id BIGINT PRIMARY KEY,
+  game TEXT,     -- game key
+  state JSONB
+);
+"""
+
+# -------------------------------------------------------------------------------------
+# UTILITIES
+# -------------------------------------------------------------------------------------
+
+ROLES_ORDER = [
+    "owner", "senior_all", "senior_chat", "senior_call", "admin_chat", "admin_call"
 ]
 
-async def random_tag_loop():
-    while True:
-        try:
-            enabled = (await db.get_config("random_tag_enabled","0"))=="1"
-            if enabled:
-                # کسی که در 24 ساعت اخیر فعال بوده ولی 60 دقیقه اخیر نبوده
-                async with db.pool.acquire() as con:
-                    rows = await con.fetch("SELECT user_id, last_active FROM users WHERE last_active IS NOT NULL")
-                now = now_tehran()
-                candidates = [r["user_id"] for r in rows if (now - r["last_active"]).total_seconds() > 3600]
-                if candidates:
-                    uid = random.choice(candidates)
-                    try:
-                        chat = await bot.get_chat(uid)
-                        await bot.send_message(MAIN_CHAT_ID, f"{mention_html(uid, chat.full_name)} — {random.choice(RANDOM_TAG_PHRASES)}")
-                    except Exception: pass
-            await asyncio.sleep(900)
-        except Exception:
-            await asyncio.sleep(60)
+ROLE_DISPLAY = {
+    "owner": "👑 مالک",
+    "senior_all": "🛡 ارشد کل",
+    "senior_chat": "🗨 ارشد چت",
+    "senior_call": "📞 ارشد کال",
+    "admin_chat": "💬 ادمین چت",
+    "admin_call": "🎙 ادمین کال",
+}
 
-@r_grp.message(F.text.regexp("^تگ روشن$"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def tag_on(msg: Message):
-    if msg.from_user.id!=OWNER_ID: return
-    await db.set_config("random_tag_enabled","1"); await msg.reply("تگ تصادفی روشن شد ✅")
+def is_persian_digits(s: str) -> bool:
+    return bool(re.fullmatch(r"[۰-۹]+", s))
 
-@r_grp.message(F.text.regexp("^تگ خاموش$"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def tag_off(msg: Message):
-    if msg.from_user.id!=OWNER_ID: return
-    await db.set_config("random_tag_enabled","0"); await msg.reply("تگ تصادفی خاموش شد ⛔️")
+def persian_to_int(s: str) -> int:
+    trans = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+    return int(s.translate(trans))
 
-# ---------- PRIVATE: MY STATS ----------
-@r_priv.callback_query(F.data=="my_stats")
-async def my_stats(cb: CallbackQuery):
-    rows = await db.get_stats_last7(cb.from_user.id)
-    if not rows:
-        await cb.message.answer("آماری یافت نشد."); await cb.answer(); return
-    lines = [f"آمار ۷ روز گذشته {mention_html(cb.from_user.id, cb.from_user.full_name)}"]
-    for r in rows:
-        d = r["day"]; d = d if isinstance(d, date) else r["day"].date()
-        lines.append(f"{fmt_jalali(d)}: پیام‌ها {r['chat_msgs']} | منشن {r['mentions']} | کال {int(r['call_minutes'])} دقیقه")
-    await cb.message.answer("\n".join(lines), disable_web_page_preview=True); await cb.answer()
+def to_jalali_str(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(TEHRAN_TZ)
+    else:
+        dt = dt.astimezone(TEHRAN_TZ)
+    jdt = jdatetime.datetime.fromgregorian(datetime=dt)
+    weekday = ["دوشنبه","سه‌شنبه","چهارشنبه","پنجشنبه","جمعه","شنبه","یکشنبه"][jdt.weekday()]  # jdt.weekday(): Mon=0
+    return f"{jdt.year:04d}/{jdt.month:02d}/{jdt.day:02d} - {weekday}"
 
-# ---------- DAILY AGG ----------
-async def daily_aggregation_loop():
-    while True:
-        try:
-            now = now_tehran()
-            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
-            delta = max(60.0, (tomorrow - now).total_seconds())
-            await asyncio.sleep(delta)
-            d = (now + timedelta(hours=3, minutes=30)).date()
-            rows = await db.sum_call_minutes_for_day(d)
-            for r in rows:
-                await db.upsert_call_minutes(d, r["user_id"], int(r["mins"] or 0))
-            await send_daily_reports_to_guard(d)
-        except Exception:
-            await asyncio.sleep(60)
+def human_td(seconds: int) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    parts = []
+    if h: parts.append(f"{h}س")
+    if m: parts.append(f"{m}د")
+    if s and not h: parts.append(f"{s}ث")
+    return " ".join(parts) if parts else "0"
 
-async def send_daily_reports_to_guard(d: date):
-    # CHAT
-    async with db.pool.acquire() as con:
-        chat_rows = await con.fetch("""
-            SELECT d.user_id, d.chat_msgs, d.mentions, u.first_name, u.last_name
-            FROM daily_stats d JOIN users u ON u.user_id=d.user_id
-            WHERE d.day=$1 AND (d.chat_msgs>0 OR d.mentions>0)
-            ORDER BY d.chat_msgs DESC
-        """, d)
-    if chat_rows:
-        lines = [f"گزارش چت مدیران - {fmt_jalali(d)}"]
-        for r in chat_rows:
-            name = ((r['first_name'] or '') + ' ' + (r['last_name'] or '')).strip()
-            lines.append(f"{mention_html(r['user_id'], name or str(r['user_id']))} — پیام‌ها: {r['chat_msgs']} | منشن: {r['mentions']}")
-        await bot.send_message(GUARD_CHAT_ID, "\n".join(lines), disable_web_page_preview=True)
+async def db() -> asyncpg.Pool:
+    global POOL
+    if POOL is None:
+        POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    return POOL
 
-    # CALL
-    async with db.pool.acquire() as con:
-        call_rows = await con.fetch("""
-            SELECT d.user_id, d.call_minutes, u.first_name, u.last_name
-            FROM daily_stats d JOIN users u ON u.user_id=d.user_id
-            WHERE d.day=$1 AND d.call_minutes>0
-            ORDER BY d.call_minutes DESC
-        """, d)
-    if call_rows:
-        lines = [f"گزارش کال مدیران - {fmt_jalali(d)}"]
-        for r in call_rows:
-            name = ((r['first_name'] or '') + ' ' + (r['last_name'] or '')).strip()
-            lines.append(f"{mention_html(r['user_id'], name or str(r['user_id']))} — {int(r['call_minutes'])} دقیقه")
-        await bot.send_message(GUARD_CHAT_ID, "\n".join(lines), disable_web_page_preview=True)
+async def init_db():
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(CREATE_SQL)
 
-# ---------- GAMES (10+) ----------
-def game_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 حدس عدد 1..100", callback_data="g:number:100"),
-         InlineKeyboardButton(text="🎯 حدس عدد 1..1000", callback_data="g:number:1000")],
-        [InlineKeyboardButton(text="⌨️ تایپ سرعتی", callback_data="g:typing"),
-         InlineKeyboardButton(text="✊✋✌️ سنگ‌کاغذقیچی", callback_data="g:rps")],
-        [InlineKeyboardButton(text="➗ ریاضی سریع", callback_data="g:math"),
-         InlineKeyboardButton(text="🔤 حدس کلمه", callback_data="g:word")],
-        [InlineKeyboardButton(text="🧩 تکمیل کلمه", callback_data="g:fill")],
-        [InlineKeyboardButton(text="🔀 درهم‌ریخته", callback_data="g:anagram"),
-         InlineKeyboardButton(text="✅❌ درست/نادرست", callback_data="g:tf")],
-        [InlineKeyboardButton(text="🧠 حافظه عددی", callback_data="g:memory")]
-    ])
+async def upsert_user(u):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO users(user_id, username, first_name, last_name, joined_at, last_seen)
+               VALUES($1,$2,$3,$4,now(),now())
+               ON CONFLICT (user_id) DO UPDATE SET
+                   username=excluded.username,
+                   first_name=excluded.first_name,
+                   last_seen=now()""",
+            u.id, u.username, u.first_name, u.last_name
+        )
 
-WORDS = ["PYTHON","TELEGRAM","SOULS","GUARD","ADMIN","VOICE","CHAT","HUMOR","SECURITY","FRIEND"]
-PERSIAN_WORDS = ["ربات","سولز","گارد","مدیر","حضور","آمار","تماس","پروفایل","کال","گفتگو"]
-
-@r_grp.message(F.text.regexp("^بازی$"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def game_cmd(msg: Message):
-    await msg.reply("یک بازی انتخاب کن:", reply_markup=game_menu_kb())
-
-# start handlers
-@r_grp.callback_query(F.data.startswith("g:number:"))
-async def g_number_start(cb: CallbackQuery):
-    limit = int(cb.data.split(":")[2])
-    GAME_STATE[cb.from_user.id] = {"type":"number","n":random.randint(1,limit),"limit":limit}
-    await cb.message.reply(f"یک عدد بین 1 تا {limit} حدس بزن. (با ارسال عدد)"); await cb.answer()
-
-@r_grp.callback_query(F.data=="g:typing")
-async def g_typing(cb: CallbackQuery):
-    word = "".join(random.choice(string.ascii_letters) for _ in range(6))
-    GAME_STATE[cb.from_user.id] = {"type":"typing","word":word,"start":datetime.utcnow()}
-    await cb.message.reply(f"این را سریع تایپ کن: <code>{word}</code>"); await cb.answer()
-
-@r_grp.callback_query(F.data=="g:rps")
-async def g_rps(cb: CallbackQuery):
-    GAME_STATE[cb.from_user.id] = {"type":"rps","await":True}
-    await cb.message.reply("یکی را بفرست: سنگ / کاغذ / قیچی"); await cb.answer()
-
-@r_grp.callback_query(F.data=="g:math")
-async def g_math(cb: CallbackQuery):
-    a,b = random.randint(2,20), random.randint(2,20)
-    op = random.choice(["+","-","*"])
-    ans = eval(f"{a}{op}{b}")
-    GAME_STATE[cb.from_user.id] = {"type":"math","ans":ans}
-    await cb.message.reply(f"حل کن: {a} {op} {b} = ?"); await cb.answer()
-
-@r_grp.callback_query(F.data=="g:word")
-async def g_word(cb: CallbackQuery):
-    w = random.choice(WORDS)
-    hint = w[0] + ("_"*(len(w)-2)) + w[-1]
-    GAME_STATE[cb.from_user.id] = {"type":"word","word":w}
-    await cb.message.reply(f"حدس کلمه (لاتین): {hint}"); await cb.answer()
-
-@r_grp.callback_query(F.data=="g:fill")
-async def g_fill(cb: CallbackQuery):
-    w = random.choice(PERSIAN_WORDS)
-    idx = random.randrange(len(w))
-    masked = w[:idx] + "‌_" + w[idx+1:]
-    GAME_STATE[cb.from_user.id] = {"type":"fill","word":w}
-    await cb.message.reply(f"حرف جاافتاده را کامل کن: {masked}"); await cb.answer()
-
-@r_grp.callback_query(F.data=="g:anagram")
-async def g_anagram(cb: CallbackQuery):
-    w = random.choice(WORDS)
-    letters = list(w); random.shuffle(letters)
-    GAME_STATE[cb.from_user.id] = {"type":"anagram","word":w}
-    await cb.message.reply(f"کلمهٔ به‌هم‌ریخته را درست کن: {' '.join(letters)}"); await cb.answer()
-
-TF_QUESTIONS = [
-    ("تهران پایتخت ایرانه.", True),
-    ("2+2=5", False),
-    ("Python زبان کاملاً کامپایلری است.", False),
-    ("خورشید یک ستاره است.", True),
-    ("تلگرام متعلق به گوگل است.", False)
-]
-
-@r_grp.callback_query(F.data=="g:tf")
-async def g_tf(cb: CallbackQuery):
-    q, a = random.choice(TF_QUESTIONS)
-    GAME_STATE[cb.from_user.id] = {"type":"tf","ans":a}
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ درسته", callback_data="tf:1"),
-                                                InlineKeyboardButton(text="❌ غلطه", callback_data="tf:0")]])
-    await cb.message.reply(q, reply_markup=kb); await cb.answer()
-
-@r_grp.callback_query(F.data.startswith("tf:"))
-async def g_tf_answer(cb: CallbackQuery):
-    if GAME_STATE.get(cb.from_user.id,{}).get("type")!="tf": await cb.answer(); return
-    ans = GAME_STATE[cb.from_user.id]["ans"]; pick = cb.data.endswith("1")
-    del GAME_STATE[cb.from_user.id]
-    await cb.message.reply("👏 درست گفتی!" if pick==ans else "نه، اشتباه بود!"); await cb.answer()
-
-@r_grp.callback_query(F.data=="g:memory")
-async def g_memory(cb: CallbackQuery):
-    seq = "".join(str(random.randint(0,9)) for _ in range(6))
-    GAME_STATE[cb.from_user.id] = {"type":"memory","seq":seq}
-    await cb.message.reply(f"این عدد را حفظ کن و بعد تکرار کن: <code>{seq}</code>"); await cb.answer()
-
-# message router for game inputs
-@r_grp.message(F.text, F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def game_handler(msg: Message):
-    state = GAME_STATE.get(msg.from_user.id)
-    if not state: return
-    t = state.get("type")
-    if t=="number":
-        try: g = int(msg.text.strip())
-        except ValueError: return
-        if g==state["n"]:
-            del GAME_STATE[msg.from_user.id]; await msg.reply(f"درست حدس زدی! 👏 عدد {state['n']} بود.")
-        elif g<state["n"]: await msg.reply("بزرگتر 🙂")
-        else: await msg.reply("کوچکتر 🙂")
-    elif t=="typing":
-        if msg.text.strip()==state["word"]:
-            delta = (datetime.utcnow()-state["start"]).total_seconds()
-            del GAME_STATE[msg.from_user.id]; await msg.reply(f"عالی! در {delta:.2f} ثانیه تایپ کردی.")
-    elif t=="rps":
-        pick = msg.text.strip()
-        choices = ["سنگ","کاغذ","قیچی"]
-        if pick not in choices: return
-        botp = random.choice(choices)
-        res = "مساوی!"
-        if (pick=="سنگ" and botp=="قیچی") or (pick=="کاغذ" and botp=="سنگ") or (pick=="قیچی" and botp=="کاغذ"):
-            res = "بردی! 🎉"
-        elif pick!=botp:
-            res = "باختی! 😅"
-        del GAME_STATE[msg.from_user.id]
-        await msg.reply(f"تو: {pick} | ربات: {botp} → {res}")
-    elif t=="math":
-        try: g = int(msg.text.strip())
-        except ValueError: return
-        ans = state["ans"]; del GAME_STATE[msg.from_user.id]
-        await msg.reply("👏 درست بود." if g==ans else f"غلط بود! جواب {ans}")
-    elif t=="word":
-        if msg.text.strip().upper()==state["word"]:
-            del GAME_STATE[msg.from_user.id]; await msg.reply("آفرین! درست گفتی 👏")
-    elif t=="fill":
-        if msg.text.strip()==state["word"]:
-            del GAME_STATE[msg.from_user.id]; await msg.reply("عالی! کامل شد 👏")
-    elif t=="anagram":
-        if msg.text.strip().upper()==state["word"]:
-            del GAME_STATE[msg.from_user.id]; await msg.reply("درست مرتب کردی! 👏")
-    elif t=="memory":
-        if msg.text.strip()==state["seq"]:
-            del GAME_STATE[msg.from_user.id]; await msg.reply("حافظه‌ات عالیه! 🧠")
+async def set_role(user_id: int, role: str, add: bool):
+    pool = await db()
+    async with pool.acquire() as con:
+        if add:
+            await con.execute("INSERT INTO roles(user_id, role) VALUES($1,$2) ON CONFLICT DO NOTHING", user_id, role)
         else:
-            del GAME_STATE[msg.from_user.id]; await msg.reply(f"اشتباه بود! عدد {state['seq']} بود.")
+            await con.execute("DELETE FROM roles WHERE user_id=$1 AND role=$2", user_id, role)
 
-# ---------- OWNER/ADMINS "ربات" NICE REPLIES ----------
-NICE_REPLIES = [f"جمله قشنگ {i}" for i in range(1,101)] + ["در خدمتم رئیس 🤝","باعث افتخاره 🌟","چشم👌","همین الان!","با قدرت ✌️"]
+async def get_roles(user_id: int) -> list[str]:
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT role FROM roles WHERE user_id=$1", user_id)
+        return [r["role"] for r in rows]
 
-@r_grp.message(F.text.regexp("^ربات$"), F.chat.id.in_([MAIN_CHAT_ID, GUARD_CHAT_ID]))
-async def pretty_bot(msg: Message):
-    role = await db.get_role(msg.from_user.id)
-    if msg.from_user.id==OWNER_ID or role in ("lead_all","lead_chat","lead_call","admin_chat","admin_call"):
-        await msg.reply(random.choice(NICE_REPLIES))
+async def has_any_role(user_id: int, roles: list[str]) -> bool:
+    if user_id == OWNER_ID:
+        return True
+    current = await get_roles(user_id)
+    return any(r in current for r in roles)
 
-# ---------- MEMBER UPDATES ----------
-@r_grp.chat_member()
-async def on_member_update(event: ChatMemberUpdated):
-    if event.from_user: await db.upsert_user(event.from_user)
+async def add_ban(user_id: int, added_by: int, reason: str | None = None):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO bans(user_id, added_by, reason) VALUES($1,$2,$3) ON CONFLICT (user_id) DO NOTHING",
+            user_id, added_by, reason
+        )
 
-# ---------- RUN ----------
-async def main():
-    await db.connect()
-    asyncio.create_task(daily_aggregation_loop())
-    asyncio.create_task(random_tag_loop())
-    print("Bot is running...")
-    await dp.start_polling(bot, allowed_updates=["message","callback_query","chat_member"])
+async def remove_ban(user_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute("DELETE FROM bans WHERE user_id=$1", user_id)
+
+async def is_banned(user_id: int) -> bool:
+    pool = await db()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT 1 FROM bans WHERE user_id=$1", user_id)
+        return row is not None
+
+async def record_message(user_id: int, chat_id: int, text: str | None, mention_count: int, has_media: bool, ts: datetime):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO messages(user_id, chat_id, ts, text, mention_count, has_media) VALUES($1,$2,$3,$4,$5,$6)",
+            user_id, chat_id, ts, text, mention_count, has_media
+        )
+
+async def start_session(user_id: int, session_type: str) -> int:
+    """Start new session; returns session id"""
+    pool = await db()
+    async with pool.acquire() as con:
+        # close existing active
+        await con.execute("UPDATE sessions SET active=FALSE, end_ts=now(), end_reason='override' WHERE user_id=$1 AND active", user_id)
+        row = await con.fetchrow(
+            "INSERT INTO sessions(user_id, session_type, start_ts, active) VALUES($1,$2,now(),TRUE) RETURNING id",
+            user_id, session_type
+        )
+        return row["id"]
+
+async def end_session_if_exists(user_id: int, reason: str = "manual"):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE sessions SET active=FALSE, end_ts=now(), end_reason=$2 WHERE user_id=$1 AND active",
+            user_id, reason
+        )
+
+async def active_session_type(user_id: int) -> str | None:
+    pool = await db()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT session_type FROM sessions WHERE user_id=$1 AND active", user_id)
+        return row["session_type"] if row else None
+
+async def daily_stats_for_date(date_from: datetime, date_to: datetime):
+    """Return stats dict for admins between two timestamps"""
+    pool = await db()
+    async with pool.acquire() as con:
+        msgs = await con.fetch("""
+            SELECT user_id, COUNT(*) AS msg_count, COALESCE(SUM(mention_count),0) AS mentions
+            FROM messages
+            WHERE chat_id=$1 AND ts >= $2 AND ts < $3
+            GROUP BY user_id
+        """, MAIN_CHAT_ID, date_from, date_to)
+
+        # session durations per type
+        sess = await con.fetch("""
+            SELECT user_id, session_type, SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(end_ts, now()), $3) - GREATEST(start_ts, $2)))) AS seconds
+            FROM sessions
+            WHERE start_ts < $3 AND COALESCE(end_ts, now()) > $2
+            GROUP BY user_id, session_type
+        """, date_from, date_to, date_to)
+
+    msg_map = {r["user_id"]: {"msg": r["msg_count"], "men": r["mentions"]} for r in msgs}
+    dur_map = {}
+    for r in sess:
+        d = dur_map.setdefault(r["user_id"], {"chat": 0, "call": 0})
+        d[r["session_type"]] = int(r["seconds"] or 0)
+    return msg_map, dur_map
+
+# -------------------------------------------------------------------------------------
+# INLINE UI BUILDERS
+# -------------------------------------------------------------------------------------
+
+def start_menu():
+    kb = [
+        [InlineKeyboardButton("📨 تماس با گارد مدیران", callback_data="contact:guard")],
+        [InlineKeyboardButton("👑 ارتباط با مالک", callback_data="contact:owner")],
+        [InlineKeyboardButton("📊 آمار من", callback_data="mystats")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def contact_user_buttons(user_id: int):
+    kb = [
+        [InlineKeyboardButton("💬 پاسخ", callback_data=f"guard_reply:{user_id}"),
+         InlineKeyboardButton("⛔ مسدود", callback_data=f"block:{user_id}")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def reply_again_buttons(user_id: int):
+    kb = [[InlineKeyboardButton("↩️ پاسخ مجدد", callback_data=f"guard_reply:{user_id}")]]
+    return InlineKeyboardMarkup(kb)
+
+def send_again_buttons():
+    kb = [[InlineKeyboardButton("📨 ارسال مجدد", callback_data="send_again")]]
+    return InlineKeyboardMarkup(kb)
+
+def session_choice_buttons():
+    kb = [[InlineKeyboardButton("🎙 کال", callback_data="session:start:call"),
+           InlineKeyboardButton("💬 چت", callback_data="session:start:chat")]]
+    return InlineKeyboardMarkup(kb)
+
+def tag_panel():
+    kb = [
+        [InlineKeyboardButton("🎙 تگ کال", callback_data="tag:call"),
+         InlineKeyboardButton("💬 تگ چت", callback_data="tag:chat")],
+        [InlineKeyboardButton("🔥 تگ اعضای فعال", callback_data="tag:active")],
+        [InlineKeyboardButton("👧 تگ دخترها", callback_data="tag:female"),
+         InlineKeyboardButton("👦 تگ پسرها", callback_data="tag:male")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def gender_panel(target_id: int):
+    kb = [[InlineKeyboardButton("👦 پسر", callback_data=f"gender:{target_id}:male"),
+           InlineKeyboardButton("👧 دختر", callback_data=f"gender:{target_id}:female")]]
+    return InlineKeyboardMarkup(kb)
+
+def games_panel():
+    kb = [
+        [InlineKeyboardButton("🎯 حدس عدد (۱۰۰)", callback_data="game:number100")],
+        [InlineKeyboardButton("🎯 حدس عدد (۱۰۰۰)", callback_data="game:number1000")],
+        [InlineKeyboardButton("🧠 حدس کلمه", callback_data="game:word")],
+        [InlineKeyboardButton("🔤 اسکرامبل (درهم)", callback_data="game:scramble")],
+        [InlineKeyboardButton("⌨️ تایپ سرعتی", callback_data="game:typing")],
+        [InlineKeyboardButton("🧮 مسابقه حساب", callback_data="game:math")],
+        [InlineKeyboardButton("🧩 اسم‌رمز اموجی", callback_data="game:emoji")],
+        [InlineKeyboardButton("✂️ سنگ‌کاغذ‌قیچی", callback_data="game:rps")],
+        [InlineKeyboardButton("🎲 دایس وار", callback_data="game:dice")],
+        [InlineKeyboardButton("🪂 حدس حروف (هنگمن)", callback_data="game:hangman")],
+        [InlineKeyboardButton("📚 معما", callback_data="game:riddle")],
+        [InlineKeyboardButton("🔢 فرد/زوج", callback_data="game:odd")],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+# -------------------------------------------------------------------------------------
+# FUN PHRASES (generated on the fly to reach 200+ without blowing the file size)
+# -------------------------------------------------------------------------------------
+
+def build_fun_pool():
+    prefix = ["عه", "هی", "خب", "الو", "وای", "اووف", "عههه", "عه رفیق", "هی دادا", "هی بچه‌ها",
+              "یالا", "سلام کجایی", "زِکی", "حاجی", "رفیق", "داش", "سلطان", "قربونت",
+              "لِم دادی؟", "بیدار؟", "خبری نیست؟", "یخ زدی؟"]
+    mid = ["کجایی", "بیدار شو", "پیدات نیست", "یه چیزی بگو", "بپر داخل", "حاضر شو",
+           "یه سر بزن", "غیبت طولانی شد", "جواب بده", "بجنب", "سرِکارمون نذار",
+           "چرا ساکتی", "پاتو بذار رو گاز", "حوصله سر رفت", "چایی آماده‌ست",
+           "بیا ویس", "چت روشنه", "دلم برات تنگ شد", "صدام میاد؟", "اوضاع خوبيه؟"]
+    suffix = ["😒", "😴", "😂", "🔥", "💥", "💤", "😎", "👀", "☕", "🎧", "📢", "🫶", "😜",
+              "😐", "😑", "😈", "💣", "👻", "🚀", "🤌", "😅", "🥱", "🥳", "🤝", "🙃", "🤨"]
+    pool = set()
+    for a in prefix:
+        for b in mid:
+            for c in random.sample(suffix, k=min(4, len(suffix))):
+                s = f"{a} {b} {c}"
+                pool.add(s)
+                if len(pool) >= 240:
+                    return list(pool)
+    return list(pool)
+
+FUN_LINES = build_fun_pool()
+
+def pretty_choice(pool):  # choose different each time
+    return random.choice(pool)
+
+ROBOT_NICE_LINES = [
+    "به‌به! چه نورانی شدی امروز ✨",
+    "سلطان، دمت گرم که اینجایی 🫶",
+    "الهی فدات شم، حواسم بهت هست 😎",
+    "قربون مرامت، مثِ همیشه خفنی 💪",
+    "یا ابالفضل! حضور تو یعنی امنیت 😌",
+    "آقا/خانم خاص! خوش اومدی 🌹",
+]*20  # makes ~120 lines
+
+# -------------------------------------------------------------------------------------
+# PERMISSIONS
+# -------------------------------------------------------------------------------------
+
+async def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+async def is_manager(user_id: int) -> bool:
+    if await is_owner(user_id):
+        return True
+    return await has_any_role(user_id, ["senior_all","senior_chat","senior_call","admin_chat","admin_call"])
+
+async def is_senior_or_owner(user_id: int) -> bool:
+    if await is_owner(user_id):
+        return True
+    return await has_any_role(user_id, ["senior_all","senior_chat","senior_call"])
+
+# -------------------------------------------------------------------------------------
+# CONTACT / BRIDGE
+# -------------------------------------------------------------------------------------
+
+async def ensure_contact_state(user_id: int, mode: str):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO contact_state(user_id, mode, can_send, updated_at) VALUES($1,$2,TRUE,now()) "
+            "ON CONFLICT (user_id) DO UPDATE SET mode=excluded.mode, can_send=TRUE, updated_at=now()",
+            user_id, mode
+        )
+
+async def can_user_send_contact(user_id: int) -> bool:
+    pool = await db()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT can_send FROM contact_state WHERE user_id=$1", user_id)
+        return bool(row["can_send"]) if row else False
+
+async def after_user_sent_contact(user_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute("UPDATE contact_state SET can_send=FALSE, updated_at=now() WHERE user_id=$1", user_id)
+
+async def allow_user_send_again(user_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute("UPDATE contact_state SET can_send=TRUE, updated_at=now() WHERE user_id=$1", user_id)
+
+async def set_reply_state(admin_id: int, target_user: int, allow=True):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO reply_state(admin_id, target_user, can_send, updated_at) VALUES($1,$2,$3,now()) "
+            "ON CONFLICT (admin_id) DO UPDATE SET target_user=$2, can_send=$3, updated_at=now()",
+            admin_id, target_user, allow
+        )
+
+async def get_reply_state(admin_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        return await con.fetchrow("SELECT target_user, can_send FROM reply_state WHERE admin_id=$1", admin_id)
+
+async def disable_reply(admin_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute("UPDATE reply_state SET can_send=FALSE, updated_at=now() WHERE admin_id=$1", admin_id)
+
+# -------------------------------------------------------------------------------------
+# SCHEDULER JOBS
+# -------------------------------------------------------------------------------------
+
+async def job_poke_random(app):
+    """Every 30 min: if toggle on → tag a random member who was active recently but silent lately."""
+    try:
+        if await get_toggle("poke_on", "0") != "1":
+            return
+        now = datetime.now(timezone.utc)
+        since = now - timedelta(hours=24)
+        silent = now - timedelta(hours=2)
+        pool = await db()
+        async with pool.acquire() as con:
+            rows = await con.fetch("""
+                WITH recent AS (
+                    SELECT user_id, MAX(ts) last_ts
+                    FROM messages
+                    WHERE chat_id=$1 AND ts >= $2
+                    GROUP BY user_id
+                )
+                SELECT r.user_id, u.first_name
+                FROM recent r
+                JOIN users u ON u.user_id=r.user_id
+                WHERE r.last_ts < $3
+                ORDER BY random()
+                LIMIT 1
+            """, MAIN_CHAT_ID, since, silent)
+        if not rows:
+            return
+        row = rows[0]
+        mention = f"<a href='tg://user?id={row['user_id']}'>{row['first_name'] or 'رفیق'}</a>"
+        line = pretty_choice(FUN_LINES)
+        await app.bot.send_message(MAIN_CHAT_ID, f"{mention} — {line}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.exception(e)
+
+async def job_nightly_stats(app):
+    """Send nightly stats to guard at 00:00 local time"""
+    now_local = datetime.now(TEHRAN_TZ)
+    day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    day_end = day_start + timedelta(days=1)
+
+    msg_map, dur_map = await daily_stats_for_date(day_start.astimezone(timezone.utc),
+                                                  day_end.astimezone(timezone.utc))
+
+    # Build two tables: chat admins + call admins
+    async def roles_for(roles):
+        pool = await db()
+        async with pool.acquire() as con:
+            rows = await con.fetch(
+                "SELECT DISTINCT u.user_id, u.first_name, u.last_name FROM users u JOIN roles r ON u.user_id=r.user_id WHERE r.role = ANY($1)",
+                roles
+            )
+            return rows
+
+    jalali = to_jalali_str(day_start)
+    lines_chat = [f"📊 آمار چت مدیران ({jalali})"]
+    for row in await roles_for(["admin_chat", "senior_chat", "senior_all", "owner"]):
+        uid = row["user_id"]
+        m = msg_map.get(uid, {"msg":0,"men":0})
+        d = dur_map.get(uid, {"chat":0,"call":0})
+        lines_chat.append(f"• <a href='tg://user?id={uid}'>{row['first_name'] or 'کاربر'}</a> — پیام: {m['msg']} | منشن: {m['men']} | حضور چت: {human_td(d['chat'])}")
+
+    lines_call = [f"🎙 آمار کال مدیران ({jalali})"]
+    for row in await roles_for(["admin_call", "senior_call", "senior_all", "owner"]):
+        uid = row["user_id"]
+        d = dur_map.get(uid, {"chat":0,"call":0})
+        lines_call.append(f"• <a href='tg://user?id={uid}'>{row['first_name'] or 'کاربر'}</a> — حضور کال: {human_td(d['call'])}")
+
+    text = "\n".join(lines_chat + ["\n"] + lines_call)
+    await app.bot.send_message(GUARD_CHAT_ID, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+# -------------------------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------------------------
+
+def parse_target_from_text(text: str) -> int | None:
+    """Extract a numeric id from text (supports Persian digits)."""
+    text = text.strip()
+    m = re.search(r"(-?\d{6,})", text)
+    if m:
+        return int(m.group(1))
+    # Persian digits
+    m = re.search(r"(-?[۰-۹]{6,})", text)
+    if m:
+        return persian_to_int(m.group(1))
+    return None
+
+async def resolve_username_to_id(ctx: ContextTypes.DEFAULT_TYPE, username: str) -> int | None:
+    try:
+        if username.startswith("@"):
+            username = username[1:]
+        chat = await ctx.bot.get_chat(username)
+        # Works if the username belongs to a user or a private chat
+        return chat.id
+    except Exception:
+        return None
+    except Exception:
+        return None
+
+def chunk_mentions(user_list: list[tuple[int,str]], n=5) -> list[str]:
+    """Return list of lines each containing up to n inline mentions."""
+    lines = []
+    batch = []
+    for uid, name in user_list:
+        batch.append(f"<a href='tg://user?id={uid}'>{name}</a>")
+        if len(batch) == n:
+            lines.append(" ".join(batch))
+            batch = []
+    if batch:
+        lines.append(" ".join(batch))
+    return lines
+
+# -------------------------------------------------------------------------------------
+# HANDLERS
+# -------------------------------------------------------------------------------------
+
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await upsert_user(u)
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.message.reply_html(
+            "سلام! من ربات کمکی <b>Souls</b> هستم.\nاز منو یکی رو انتخاب کن:",
+            reply_markup=start_menu()
+        )
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data.startswith("contact:"):
+        mode = data.split(":",1)[1]
+        await ensure_contact_state(q.from_user.id, mode)
+        if mode == "guard":
+            await q.message.edit_text(
+                "پیامت رو همینجا بفرست. فقط اولین پیام منتقل میشه؛ برای پیام بعدی روی «ارسال مجدد» بزن.",
+                reply_markup=send_again_buttons()
+            )
+        else:
+            await q.message.edit_text(
+                "در ارتباط با مالک هستی. اولین پیامت منتقل میشه؛ برای پیام بعدی «ارسال مجدد».",
+                reply_markup=send_again_buttons()
+            )
+        return
+
+    if data == "send_again":
+        await allow_user_send_again(q.from_user.id)
+        await q.message.reply_text("اوکی؛ پیام بعدی که بفرستی منتقل میشه.")
+        return
+
+    if data == "mystats":
+        await send_user_stats(q.from_user.id, update, context)
+        return
+
+    if data.startswith("guard_reply:"):
+        target = int(data.split(":")[1])
+        await set_reply_state(q.from_user.id, target, allow=True)
+        await q.message.reply_html(
+            f"پاسخ به <a href='tg://user?id={target}'>کاربر</a> فعال شد. یک پیام بفرست.",
+            reply_markup=reply_again_buttons(target)
+        )
+        return
+
+    if data.startswith("block:"):
+        uid = int(data.split(":")[1])
+        if not await is_manager(q.from_user.id):
+            await q.message.reply_text("اجازه نداری عزیز.")
+            return
+        await add_ban(uid, q.from_user.id, "blocked-from-bridge")
+        # try to ban from main chat as well
+        try:
+            await context.bot.ban_chat_member(MAIN_CHAT_ID, uid)
+        except Exception:
+            pass
+        await q.message.reply_text("کاربر به لیست ممنوع افزوده شد.")
+        return
+
+    if data.startswith("session:start:"):
+        stype = data.split(":")[-1]
+        await start_session(q.from_user.id, stype)
+        mark = "✅ شروع فعالیت ثبت شد"
+        await context.bot.send_message(GUARD_CHAT_ID,
+            f"{mark} — {ROLE_DISPLAY.get('admin_'+('chat' if stype=='chat' else 'call'),'مدیر')} "
+            f"<a href='tg://user?id={q.from_user.id}'>{q.from_user.first_name}</a>",
+            parse_mode=ParseMode.HTML
+        )
+        await q.message.reply_text("شروع شد. موفق باشی 🌟")
+        return
+
+    if data.startswith("tag:"):
+        _, kind = data.split(":")
+        reply_to = q.message.reply_to_message.message_id if q.message and q.message.reply_to_message else None
+        await do_tag(kind, update, context, reply_to=reply_to)
+        return
+
+    if data.startswith("gender:"):
+        _, target, g = data.split(":")
+        await set_gender(int(target), g, update, context)
+        return
+
+    if data.startswith("game:"):
+        _, game_key = data.split(":")
+        await start_game(game_key, update, context)
+        return
+
+# -----------------------------------------
+
+async def bridge_from_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """When user is in contact mode and allowed, forward/copy the message to target (guard or owner)."""
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return
+    user_id = update.effective_user.id
+    pool = await db()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT mode, can_send FROM contact_state WHERE user_id=$1", user_id)
+    if not row or not row["can_send"]:
+        return
+    mode = row["mode"]
+    target_chat = GUARD_CHAT_ID if mode == "guard" else OWNER_ID
+
+    # For media-group (album)
+    if update.message and update.message.media_group_id:
+        # PTB already groups photos/video via MediaGroupHandler, but we can just forward copy.
+        try:
+            await update.message.copy(target_chat, caption=update.message.caption, caption_entities=update.message.caption_entities,
+                                      reply_markup=contact_user_buttons(user_id) if mode=="guard" else None)
+        except Exception as e:
+            log.exception(e)
+    else:
+        try:
+            await update.message.copy(target_chat, caption=update.message.caption, caption_entities=update.message.caption_entities,
+                                      reply_markup=contact_user_buttons(user_id) if mode=="guard" else None)
+        except Exception as e:
+            log.exception(e)
+
+    await after_user_sent_contact(user_id)
+    await update.message.reply_text("پیامت منتقل شد ✔️", reply_markup=send_again_buttons())
+
+async def guard_reply_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Listen in guard chat; if an admin has active reply_state, forward next message to target user once."""
+    if update.effective_chat.id != GUARD_CHAT_ID:
+        return
+    admin_id = update.effective_user.id
+    st = await get_reply_state(admin_id)
+    if not st or not st["can_send"]:
+        return
+    target = st["target_user"]
+    try:
+        await update.message.copy(target)
+        await context.bot.send_message(target, "📩 پاسخ گارد رسید.")
+        await disable_reply(admin_id)
+        await update.message.reply_text("پاسخ ارسال شد ✔️", reply_markup=reply_again_buttons(target))
+    except Exception as e:
+        log.exception(e)
+
+# -----------------------------------------
+
+async def on_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ban enforcement and user tracking on join/leave."""
+    cm = update.chat_member
+    user = cm.new_chat_member.user
+    await upsert_user(user)
+    if cm.chat.id != MAIN_CHAT_ID:
+        return
+
+    status = cm.new_chat_member.status
+    if status in ("member", "administrator"):
+        if await is_banned(user.id):
+            try:
+                await context.bot.ban_chat_member(MAIN_CHAT_ID, user.id)
+                await context.bot.send_message(GUARD_CHAT_ID, f"⛔ کاربر ممنوع سعی کرد وارد شود: <a href='tg://user?id={user.id}'>{user.first_name}</a>", parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.exception(e)
+    elif status in ("left", "kicked"):
+        # optional: cleanup roles/gender when user leaves
+        pool = await db()
+        async with pool.acquire() as con:
+            await con.execute("DELETE FROM roles WHERE user_id=$1", user.id)
+        # gender left as history
+
+# -----------------------------------------
+
+INACTIVITY_MINUTES = 5
+INACTIVITY_JOBS = {}  # user_id -> job
+
+async def on_main_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Capture messages for stats & popup session start if manager without active session."""
+    if update.effective_chat.id != MAIN_CHAT_ID:
+        return
+    msg = update.message
+    u = msg.from_user
+    await upsert_user(u)
+
+    # record message for stats
+    mention_count = 0
+    if msg.entities:
+        for e in msg.entities:
+            if e.type in ("mention", "text_mention"):
+                mention_count += 1
+    has_media = any([msg.photo, msg.video, msg.audio, msg.document, msg.sticker, msg.voice, msg.animation])
+    await record_message(u.id, MAIN_CHAT_ID, msg.text or msg.caption, mention_count, has_media, msg.date or datetime.now(timezone.utc))
+
+    # if manager and no active session -> show popup
+    if await is_manager(u.id):
+        st = await active_session_type(u.id)
+        if not st:
+            try:
+                await msg.reply_text("حضور رو ثبت کنیم؟", reply_markup=session_choice_buttons())
+            except Exception:
+                pass
+
+        # setup inactivity end if has active session
+        st = await active_session_type(u.id)
+        if st:
+            # reset job
+            job = INACTIVITY_JOBS.get(u.id)
+            if job:
+                job.schedule_removal()
+            job = context.job_queue.run_once(lambda c: asyncio.create_task(mark_inactive_timeout(u.id, context)),
+                                             when=INACTIVITY_MINUTES*60)
+            INACTIVITY_JOBS[u.id] = job
+
+# -----------------------------------------
+
+async def mark_inactive_timeout(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await end_session_if_exists(user_id, reason="timeout")
+    try:
+        await context.bot.send_message(GUARD_CHAT_ID,
+            f"❌ پایان فعالیت (عدم فعالیت) — <a href='tg://user?id={user_id}'>کاربر</a>", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+# -----------------------------------------
+# TEXT COMMANDS (no slash)
+# -----------------------------------------
+
+async def on_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    u = update.effective_user
+    chat_id = update.effective_chat.id
+
+    # normalize spaces
+    t = re.sub(r"\s+", " ", text)
+
+    # owner-only quick fun switch
+    if t in ("تگ خاموش", "خاموش تگ"):
+        if not await is_owner(u.id):
+            return
+        await set_toggle("poke_on", "0")
+        await update.message.reply_text("پینگ فان خاموش شد.")
+        return
+    if t in ("تگ روشن", "روشن تگ"):
+        if not await is_owner(u.id):
+            return
+        await set_toggle("poke_on", "1")
+        await update.message.reply_text("پینگ فان روشن شد.")
+        return
+
+    # help
+    if t.startswith("راهنما"):
+        await send_help(update, context)
+        return
+
+    # ban/unban (manager+)
+    if t.startswith("ممنوع"):
+        if not await is_manager(u.id):
+            return
+        target = await extract_target(update, context, t)
+        if not target:
+            await update.message.reply_text("هدف مشخص نیست.")
+            return
+        await add_ban(target, u.id, "manual")
+        try:
+            await context.bot.ban_chat_member(MAIN_CHAT_ID, target)
+        except Exception:
+            pass
+        await update.message.reply_text("ثبت شد: کاربر ممنوع.")
+        return
+
+    if t.startswith("آزاد"):
+        if not await is_manager(u.id):
+            return
+        target = await extract_target(update, context, t)
+        if not target:
+            await update.message.reply_text("هدف مشخص نیست.")
+            return
+        await remove_ban(target)
+        try:
+            await context.bot.unban_chat_member(MAIN_CHAT_ID, target, only_if_banned=True)
+        except Exception:
+            pass
+        await update.message.reply_text("کاربر از لیست ممنوع خارج شد.")
+        return
+
+    # promotions/demotions (owner)
+    if t.startswith("ترفیع"):
+        if not await is_owner(u.id):
+            return
+        await do_promotion(update, context, t)
+        return
+
+    if t.startswith("عزل"):
+        if not await is_owner(u.id):
+            return
+        await do_demotion(update, context, t)
+        return
+
+    # list guard
+    if t.startswith("لیست گارد"):
+        if not await is_senior_or_owner(u.id):
+            return
+        await list_guard(update, context)
+        return
+
+    # id stats
+    if t in ("ایدی", "آیدی", "id"):
+        await cmd_id(update, context)
+        return
+
+    # list bans
+    if t.startswith("لیست ممنوع"):
+        if not await is_manager(u.id):
+            return
+        await list_banned(update, context)
+        return
+
+    # tag open panel
+    if t.startswith("تگ") and t == "تگ":
+        await update.message.reply_text("کدوم دسته رو تگ کنم؟", reply_markup=tag_panel())
+        return
+
+    # gender
+    if t.startswith("جنسیت"):
+        if not await is_manager(u.id):
+            return
+        target = update.message.reply_to_message.from_user.id if update.message.reply_to_message else u.id
+        await update.message.reply_text("جنسیت رو انتخاب کن:", reply_markup=gender_panel(target))
+        return
+
+    # session manual
+    if t in ("ثبت", "ثبت حضور"):
+        await update.message.reply_text("نوع فعالیت رو انتخاب کن:", reply_markup=session_choice_buttons())
+        return
+    if t in ("ثبت خروج", "پایان"):
+        await end_session_if_exists(u.id, reason="manual")
+        await update.message.reply_text("پایان فعالیت شما گزارش شد. خسته نباشید 🌙")
+        try:
+            await context.bot.send_message(GUARD_CHAT_ID,
+                f"❎ پایان فعالیت — <a href='tg://user?id={u.id}'>{u.first_name}</a>",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    # games
+    if t == "بازی":
+        await update.message.reply_text("یک بازی انتخاب کن:", reply_markup=games_panel())
+        return
+
+    # robot (for managers)
+    if t == "ربات":
+        if not await is_manager(u.id):
+            return
+        await update.message.reply_text(pretty_choice(ROBOT_NICE_LINES))
+        return
+
+# -------- helper for target extraction
+
+async def extract_target(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int | None:
+    # try reply target
+    if update.message and update.message.reply_to_message:
+        return update.message.reply_to_message.from_user.id
+    # try username or id in text
+    parts = text.split()
+    if len(parts) >= 2:
+        arg = parts[1]
+        if arg.startswith("@"):
+            uid = await resolve_username_to_id(context, arg)
+            return uid
+        if arg.lstrip("-").isdigit() or is_persian_digits(arg):
+            return persian_to_int(arg) if is_persian_digits(arg) else int(arg)
+    return None
+
+# -------------------------------------------------------------------------------------
+# HELP
+# -------------------------------------------------------------------------------------
+
+async def send_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    owner_note = "✅ دستورات مالک از هرجا قابل اجراست."
+    text = (
+        "راهنما (خلاصه):\n"
+        "• «ثبت» → شروع حضور (انتخاب چت/کال)\n"
+        "• «ثبت خروج» → پایان حضور\n"
+        "• «ممنوع [ریپلای/آیدی/یوزرنیم]» / «آزاد ...»\n"
+        "• «ترفیع چت/کال/ارشد چت/ارشد کال/ارشد کل [هدف]»\n"
+        "• «عزل چت/کال/ارشد چت/ارشد کال/ارشد کل [هدف]»\n"
+        "• «لیست گارد» → نمایش مدیران به ترتیب سمت\n"
+        "• «ایدی» یا «آیدی» → آمار ۷ روز گذشته (برای خودت یا با ریپلای برای دیگری)\n"
+        "• «تگ» → پنل تگ (کال، چت، فعال‌ها، دخترها، پسرها)\n"
+        "• «جنسیت» → پنل تعیین جنسیت (برای خودت یا با ریپلای)\n"
+        "• «بازی» → پنل بازی‌ها\n"
+        "• «ربات» → جمله قشنگ از ربات (فقط مقام‌دار)\n"
+        f"\n{owner_note}\n"
+        "یادآوری: حالت پرایوسی بات رو در BotFather خاموش کنید."
+    )
+    await update.message.reply_text(text)
+
+# -------------------------------------------------------------------------------------
+# PROMOTIONS / DEMOTIONS
+# -------------------------------------------------------------------------------------
+
+ROLE_KEYWORDS = {
+    "چت": "admin_chat",
+    "کال": "admin_call",
+    "ارشد چت": "senior_chat",
+    "ارشد کال": "senior_call",
+    "ارشد کل": "senior_all",
+}
+
+async def do_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    # e.g. "ترفیع چت" with reply/arg
+    role = None
+    for k, v in ROLE_KEYWORDS.items():
+        if f"ترفیع {k}" in text:
+            role = v
+            break
+    if not role:
+        await update.message.reply_text("سمت رو مشخص کن (مثلاً: «ترفیع چت»).")
+        return
+    target = await extract_target(update, context, text)
+    if not target:
+        await update.message.reply_text("هدف نامشخصه.")
+        return
+    await set_role(target, role, True)
+    await update.message.reply_text("ترفیع انجام شد ✔️")
+
+async def do_demotion(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    role = None
+    for k, v in ROLE_KEYWORDS.items():
+        if f"عزل {k}" in text:
+            role = v
+            break
+    if not role:
+        await update.message.reply_text("سمت رو مشخص کن (مثلاً: «عزل چت»).")
+        return
+    target = await extract_target(update, context, text)
+    if not target:
+        await update.message.reply_text("هدف نامشخصه.")
+        return
+    await set_role(target, role, False)
+    await update.message.reply_text("عزل انجام شد ✔️")
+
+# -------------------------------------------------------------------------------------
+# LIST GUARD
+# -------------------------------------------------------------------------------------
+
+async def list_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT user_id FROM bans ORDER BY created_at DESC LIMIT 100")
+    if not rows:
+        await update.message.reply_text("لیست ممنوع خالیه.")
+        return
+    users = []
+    for r in rows:
+        uid = r["user_id"]
+        try:
+            member = await context.bot.get_chat_member(MAIN_CHAT_ID, uid)
+            name = member.user.first_name or "کاربر"
+        except Exception:
+            name = "کاربر"
+        users.append((uid, name))
+    lines = chunk_mentions(users, n=5)
+    # Send to the current chat and also privately to owner (best effort)
+    await update.message.reply_html("\n".join(lines))
+    try:
+        await context.bot.send_message(OWNER_ID, "لیست ممنوع:\n\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+async def list_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch("""
+            SELECT u.user_id, u.first_name, r.role
+            FROM users u JOIN roles r ON u.user_id=r.user_id
+        """)
+    # order by role importance
+    grouped = {r: [] for r in ROLES_ORDER}
+    for row in rows:
+        grouped[row["role"]].append((row["user_id"], row["first_name"] or "کاربر"))
+
+    lines = []
+    for role in ROLES_ORDER:
+        if grouped[role]:
+            role_name = ROLE_DISPLAY.get(role, role)
+            lines.append(f"{role_name}:")
+            lines += chunk_mentions(grouped[role])
+            lines.append("")
+    await update.message.reply_html("\n".join(lines) or "چیزی پیدا نشد.")
+
+# -------------------------------------------------------------------------------------
+# ID STATS (7-day)
+# -------------------------------------------------------------------------------------
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    target = update.message.reply_to_message.from_user.id if update.message.reply_to_message else update.effective_user.id
+    # gather 7-day stats
+    now = datetime.now(TEHRAN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    lines = []
+    pool = await db()
+    async with pool.acquire() as con:
+        for i in range(7):
+            start = (now - timedelta(days=i+1)).astimezone(timezone.utc)
+            end = (now - timedelta(days=i)).astimezone(timezone.utc)
+            mm = await con.fetchrow("""
+                SELECT COUNT(*) c, COALESCE(SUM(mention_count),0) m FROM messages
+                WHERE chat_id=$1 AND user_id=$2 AND ts >= $3 AND ts < $4
+            """, MAIN_CHAT_ID, target, start, end)
+            ss = await con.fetch("""
+                SELECT session_type, SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(end_ts, now()), $3) - GREATEST(start_ts, $2)))) AS seconds
+                FROM sessions WHERE user_id=$1 AND start_ts < $3 AND COALESCE(end_ts, now()) > $2 GROUP BY session_type
+            """, target, start, end)
+            dmap = {"chat":0,"call":0}
+            for r in ss:
+                dmap[r["session_type"]] = int(r["seconds"] or 0)
+            daytxt = to_jalali_str((now - timedelta(days=i+1)))
+            lines.append(f"{daytxt}\nپیام: {mm['c']} | منشن: {mm['m']} | چت: {human_td(dmap['chat'])} | کال: {human_td(dmap['call'])}")
+    # photo (best effort)
+    try:
+        photos = await context.bot.get_user_profile_photos(target, limit=1)
+        if photos.total_count > 0:
+            fid = photos.photos[0][-1].file_id
+            await update.message.reply_photo(fid, caption="\n\n".join(lines))
+            return
+    except Exception:
+        pass
+    await update.message.reply_text("\n\n".join(lines))
+
+# -------------------------------------------------------------------------------------
+# TAGGING
+# -------------------------------------------------------------------------------------
+
+async def do_tag(kind: str, update: Update, context: ContextTypes.DEFAULT_TYPE, reply_to: int | None = None):
+    pool = await db()
+    async with pool.acquire() as con:
+        if kind == "call":
+            rows = await con.fetch("SELECT u.user_id, u.first_name FROM users u JOIN roles r ON u.user_id=r.user_id WHERE r.role = ANY($1)",
+                                   ["admin_call","senior_call","senior_all","owner"])
+        elif kind == "chat":
+            rows = await con.fetch("SELECT u.user_id, u.first_name FROM users u JOIN roles r ON u.user_id=r.user_id WHERE r.role = ANY($1)",
+                                   ["admin_chat","senior_chat","senior_all","owner"])
+        elif kind == "active":
+            since = datetime.now(timezone.utc) - timedelta(days=2)
+            rows = await con.fetch("""
+                SELECT DISTINCT u.user_id, u.first_name FROM users u
+                JOIN messages m ON u.user_id=m.user_id
+                WHERE m.chat_id=$1 AND m.ts >= $2
+                LIMIT 200
+            """, MAIN_CHAT_ID, since)
+        elif kind in ("male","female"):
+            rows = await con.fetch("""SELECT user_id, first_name FROM users WHERE gender=$1""",
+                                   ("male" if kind=="male" else "female"))
+        else:
+            rows = []
+    data = [(r["user_id"], r["first_name"] or "کاربر") for r in rows]
+    if not data:
+        await context.bot.send_message(update.effective_chat.id, "کسی پیدا نشد.")
+        return
+    lines = chunk_mentions(data, n=5)
+    for line in lines:
+        await context.bot.send_message(update.effective_chat.id, line, parse_mode=ParseMode.HTML, reply_to_message_id=reply_to)
+
+# -------------------------------------------------------------------------------------
+# GENDER
+# -------------------------------------------------------------------------------------
+
+async def set_gender(user_id: int, gender: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute("UPDATE users SET gender=$2 WHERE user_id=$1", user_id, gender)
+    await context.bot.send_message(update.effective_chat.id, "ثبت شد ✔️")
+
+# -------------------------------------------------------------------------------------
+# TOGGLES
+# -------------------------------------------------------------------------------------
+
+async def set_toggle(key: str, value: str):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute("INSERT INTO toggles(key,value) VALUES($1,$2) ON CONFLICT (key) DO UPDATE SET value=$2", key, value)
+
+async def get_toggle(key: str, default: str = "0") -> str:
+    pool = await db()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT value FROM toggles WHERE key=$1", key)
+        return row["value"] if row else default
+
+# -------------------------------------------------------------------------------------
+# GAMES
+# -------------------------------------------------------------------------------------
+
+WORDS = ["سولز", "گارد", "مدیریت", "ربات", "تخفف", "پرچم", "هوش", "سیب", "مداد", "خلاقیت", "قهوه", "خیابان", "امروز", "خوشگل"]
+EMOJI_CODE = {
+    "🦁👑": "شیرشاه",
+    "🌧️☔": "باران",
+    "🔥📞": "کال داغ",
+    "🧠⚡": "ایده",
+}
+
+RIDDLES = [
+    ("اون چیه که هر چی برمیداری بزرگتر میشه؟", "چاله"),
+    ("بدون نفس راه میره، بدون بال پرواز میکنه؟", "ابر"),
+]
+
+async def game_set(user_id: int, game: str, state: dict):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO games(user_id, game, state) VALUES($1,$2,$3) ON CONFLICT (user_id) DO UPDATE SET game=$2, state=$3",
+            user_id, game, json.dumps(state, ensure_ascii=False)
+        )
+
+async def game_get(user_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT game, state FROM games WHERE user_id=$1", user_id)
+        if not row:
+            return None, None
+        return row["game"], json.loads(row["state"])
+
+async def game_clear(user_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute("DELETE FROM games WHERE user_id=$1", user_id)
+
+async def start_game(game_key: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if game_key == "number100":
+        target = random.randint(1, 100)
+        await game_set(uid, "number", {"max":100, "target":target, "tries":0})
+        await update.effective_message.reply_text("یه عدد بین ۱ تا ۱۰۰ حدس بزن.")
+    elif game_key == "number1000":
+        target = random.randint(1, 1000)
+        await game_set(uid, "number", {"max":1000, "target":target, "tries":0})
+        await update.effective_message.reply_text("یه عدد بین ۱ تا ۱۰۰۰ حدس بزن.")
+    elif game_key == "word":
+        word = random.choice(WORDS)
+        tip = word[0] + ("‌" * (len(word)-1))
+        await game_set(uid, "word", {"word":word, "tip":tip, "tries":0})
+        await update.effective_message.reply_text(f"کلمه رو حدس بزن! نکته: {tip}")
+    elif game_key == "scramble":
+        word = random.choice(WORDS)
+        scrambled = "".join(random.sample(list(word), len(word)))
+        await game_set(uid, "scramble", {"word":word, "scrambled":scrambled})
+        await update.effective_message.reply_text(f"حروف رو مرتب کن: {scrambled}")
+    elif game_key == "typing":
+        text = random.choice([
+            "هوا بس ناجوانمردانه سرد است",
+            "صداش کن بیاد اینجا",
+            "رباتای خوب هیچوقت نمی‌خوابن",
+            "گارد سولز همیشه بیداره"
+        ])
+        await game_set(uid, "typing", {"text":text, "start":datetime.now(timezone.utc).isoformat()})
+        await update.effective_message.reply_text(f"این جمله رو دقیق و سریع تایپ کن:\n\n{text}")
+    elif game_key == "math":
+        a, b = random.randint(2, 30), random.randint(2, 30)
+        op = random.choice(["+","-","*"])
+        expr = f"{a} {op} {b}"
+        ans = eval(expr.replace("x","*"))
+        await game_set(uid, "math", {"expr":expr, "ans":ans})
+        await update.effective_message.reply_text(f"حساب کن: {expr} = ?")
+    elif game_key == "emoji":
+        code, ans = random.choice(list(EMOJI_CODE.items()))
+        await game_set(uid, "emoji", {"code":code, "ans":ans})
+        await update.effective_message.reply_text(f"اسم‌رمز اموجی رو حدس بزن: {code}")
+    elif game_key == "rps":
+        await game_set(uid, "rps", {"await":True})
+        await update.effective_message.reply_text("سنگ/کاغذ/قیچی رو بنویس.")
+    elif game_key == "dice":
+        you = random.randint(1,6)
+        bot = random.randint(1,6)
+        res = "بردی! 🎉" if you>bot else ("باختی 😅" if you<bot else "مساوی 😐")
+        await update.effective_message.reply_text(f"تو: {you} | من: {bot} → {res}")
+    elif game_key == "hangman":
+        word = random.choice(WORDS)
+        hidden = ["_" for _ in word]
+        await game_set(uid, "hang", {"word":word, "shown":" ".join(hidden), "used":[], "left":6})
+        await update.effective_message.reply_text(f"حدس حروف: { ' '.join(hidden) } (۶ فرصت)")
+    elif game_key == "riddle":
+        q,a = random.choice(RIDDLES)
+        await game_set(uid, "riddle", {"ans":a})
+        await update.effective_message.reply_text(q)
+    elif game_key == "odd":
+        n = random.randint(1, 30)
+        await game_set(uid, "odd", {"n":n})
+        await update.effective_message.reply_text(f"{n} فرده یا جفت؟ بنویس «فرد» یا «زوج».")
+    else:
+        await update.effective_message.reply_text("بازی پیدا نشد.")
+
+async def games_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    game, state = await game_get(uid)
+    if not game:
+        return
+    txt = (update.message.text or "").strip().lower()
+    if game == "number":
+        if txt.isdigit():
+            g = int(txt)
+            target = state["target"]
+            state["tries"] += 1
+            if g == target:
+                await update.message.reply_text(f"بردی! تو {state['tries']} حدس👌")
+                await game_clear(uid)
+            elif g < target:
+                await update.message.reply_text("بزرگ‌تره ↑")
+                await game_set(uid, game, state)
+            else:
+                await update.message.reply_text("کوچیک‌تره ↓")
+                await game_set(uid, game, state)
+        return
+    if game == "word":
+        if txt == state["word"]:
+            await update.message.reply_text("درست گفتی! 🎉")
+            await game_clear(uid)
+        else:
+            await update.message.reply_text("نه! دوباره حدس بزن.")
+        return
+    if game == "scramble":
+        if txt == state["word"]:
+            await update.message.reply_text("ایول!")
+            await game_clear(uid)
+        else:
+            await update.message.reply_text("نه، دوباره...")
+        return
+    if game == "typing":
+        if txt == state["text"]:
+            start = datetime.fromisoformat(state["start"])
+            delta = datetime.now(timezone.utc) - start
+            await update.message.reply_text(f"عالی! زمان: {round(delta.total_seconds(),2)} ثانیه")
+            await game_clear(uid)
+        else:
+            await update.message.reply_text("غلط شد! دوباره سعی کن.")
+        return
+    if game == "math":
+        try:
+            val = int(txt)
+        except Exception:
+            return
+        if val == state["ans"]:
+            await update.message.reply_text("صحیح 👌")
+            await game_clear(uid)
+        else:
+            await update.message.reply_text("نه!")
+        return
+    if game == "emoji":
+        if state["ans"] in txt:
+            await update.message.reply_text("درست گفتی!")
+            await game_clear(uid)
+        else:
+            await update.message.reply_text("نچ 🙃")
+        return
+    if game == "rps":
+        mapping = {"سنگ":0,"کاغذ":1,"قیچی":2}
+        if txt not in mapping:
+            return
+        b = random.choice(list(mapping.keys()))
+        you = mapping[txt]; bot = mapping[b]
+        res = "بردی 🎉" if (you-bot)%3==1 else ("باختی 😅" if you!=bot else "مساوی 😐")
+        await update.message.reply_text(f"تو: {txt} | من: {b} → {res}")
+        await game_clear(uid)
+        return
+    if game == "hang":
+        if len(txt) == 1:
+            ch = txt
+            if ch in state["used"]:
+                await update.message.reply_text("این حرف رو زدی قبلاً!")
+                return
+            state["used"].append(ch)
+            word = state["word"]
+            shown = list(state["shown"].replace(" ",""))
+            found = False
+            for i, c in enumerate(word):
+                if c == ch:
+                    shown[i] = ch; found=True
+            if not found:
+                state["left"] -= 1
+            new_shown = " ".join(shown)
+            state["shown"] = new_shown
+            if "_" not in shown:
+                await update.message.reply_text(f"بردی! {word}")
+                await game_clear(uid); return
+            if state["left"] <= 0:
+                await update.message.reply_text(f"باختی! کلمه: {word}")
+                await game_clear(uid); return
+            await update.message.reply_text(f"{new_shown} ({state['left']} فرصت)")
+            await game_set(uid, "hang", state)
+        else:
+            if txt == state["word"]:
+                await update.message.reply_text("خوبه! درست بود.")
+                await game_clear(uid)
+            else:
+                state["left"] -= 2
+                if state["left"] <= 0:
+                    await update.message.reply_text(f"باختی! کلمه: {state['word']}")
+                    await game_clear(uid)
+                else:
+                    await update.message.reply_text(f"نشد! ({state['left']} فرصت)")
+                    await game_set(uid, "hang", state)
+        return
+    if game == "riddle":
+        if state["ans"] in txt:
+            await update.message.reply_text("درسته!")
+            await game_clear(uid)
+        else:
+            await update.message.reply_text("نخیر!")
+        return
+    if game == "odd":
+        if "فرد" in txt or "زوج" in txt:
+            res = "فرد" if state["n"]%2==1 else "زوج"
+            await update.message.reply_text(f"جواب: {res}")
+            await game_clear(uid)
+        return
+
+# -------------------------------------------------------------------------------------
+# NIGHTLY + STARTUP
+# -------------------------------------------------------------------------------------
+
+async def post_init(app):
+    await init_db()
+    # Schedule nightly stats at 00:00 local time
+    now = datetime.now(TEHRAN_TZ)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    delay = (midnight - now).total_seconds()
+    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(job_nightly_stats(app)), interval=24*3600, first=delay)
+    # Fun poke job: every 30 minutes
+    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(job_poke_random(app)), interval=30*60, first=60)
+
+# -------------------------------------------------------------------------------------
+# USER STATS FROM START MENU
+# -------------------------------------------------------------------------------------
+
+async def send_user_stats(user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now(TEHRAN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    lines = []
+    pool = await db()
+    async with pool.acquire() as con:
+        for i in range(7):
+            start = (now - timedelta(days=i+1)).astimezone(timezone.utc)
+            end = (now - timedelta(days=i)).astimezone(timezone.utc)
+            mm = await con.fetchrow("""SELECT COUNT(*) c, COALESCE(SUM(mention_count),0) m
+                                       FROM messages WHERE chat_id=$1 AND user_id=$2 AND ts >= $3 AND ts < $4""",
+                                    MAIN_CHAT_ID, user_id, start, end)
+            ss = await con.fetch("""SELECT session_type, SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(end_ts, now()), $3) - GREATEST(start_ts, $2)))) AS seconds
+                                    FROM sessions WHERE user_id=$1 AND start_ts < $3 AND COALESCE(end_ts, now()) > $2 GROUP BY session_type""",
+                                    user_id, start, end)
+            dmap = {"chat":0,"call":0}
+            for r in ss:
+                dmap[r["session_type"]] = int(r["seconds"] or 0)
+            daytxt = to_jalali_str((now - timedelta(days=i+1)))
+            lines.append(f"{daytxt}\nپیام: {mm['c']} | منشن: {mm['m']} | چت: {human_td(dmap['chat'])} | کال: {human_td(dmap['call'])}")
+    await context.bot.send_message(update.effective_chat.id, "\n\n".join(lines))
+
+# -------------------------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------------------------
+
+def main():
+    if not BOT_TOKEN or not DATABASE_URL or not MAIN_CHAT_ID or not GUARD_CHAT_ID or not OWNER_ID:
+        raise SystemExit("One or more required env vars are missing.")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # startup
+    app.post_init = post_init
+
+    # /start
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Regex(r"^/start$"), on_start))
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    # Bridge from user PV
+    # Any message in private chat considered for contact mode
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, bridge_from_user))
+
+    # Guard reply
+    app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) & ~filters.COMMAND, guard_reply_listener))
+
+    # Member updates in main chat
+    app.add_handler(ChatMemberHandler(on_member_update, ChatMemberHandler.CHAT_MEMBER))
+
+    # Main group messages for stats, popup, inactivity
+    app.add_handler(MessageHandler(filters.Chat(MAIN_CHAT_ID) & ~filters.COMMAND, on_main_group_message))
+
+    # Games input (works everywhere)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, games_input))
+
+    # Plain-text commands (everywhere; owner commands allowed anywhere)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_command))
+
+    log.info("Bot starting...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit): print("Bot stopped")
+    main()
