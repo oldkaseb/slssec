@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+python-telegram-bot[job-queue]==20.7
 asyncpg==0.29.0
-pytz==2024.1
+pytz==2025.1
 jdatetime==4.1.1
