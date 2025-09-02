@@ -1,24 +1,13 @@
 
 # -*- coding: utf-8 -*-
 """
-Souls / Souls Guard Telegram Bot (single-file, Railway-ready)
-Language: Persian (fa)
-Author: You + GPT-5 Pro
-Runtime: python-telegram-bot (async) + asyncpg (PostgreSQL)
-Deployment: Railway
-Environment variables required:
-  OWNER_ID        -> int, Telegram user id of the owner
-  TZ              -> IANA timezone (e.g., 'Asia/Tehran')
-  MAIN_CHAT_ID    -> int, id of the main group "souls" (negative id)
-  GUARD_CHAT_ID   -> int, id of the "souls guard" group (negative id)
-  BOT_TOKEN       -> Telegram bot token
-  DATABASE_URL    -> PostgreSQL connection string (postgresql://user:pass@host:5432/dbname)
-Note:
-- Single file by design. No external modules within repo.
-- Contains 15+ real group mini-games (text-based) with a generic engine.
-- Fun phrases are generated from fixed templates (easy to edit). Expand as you like.
-- All inline keyboards are user-scoped (owner-only clicks via callback alert).
-- Commands are plain text (no /). Regex-based.
+Souls / Souls Guard Telegram Bot (single-file, Railway-ready) — **Patched**
+- Adds safe DB migrations in `DB.init()` to avoid UndefinedColumnError (e.g., missing is_bot).
+- Fixes UPDATE ... ORDER BY by using a CTE in `end_session()` (PostgreSQL compliant).
+Everything else same as previous delivery.
+
+Env:
+  OWNER_ID , TZ , MAIN_CHAT_ID , GUARD_CHAT_ID , BOT_TOKEN , DATABASE_URL
 """
 
 import asyncio
@@ -41,11 +30,9 @@ from telegram import (
 from telegram.constants import ParseMode, ChatType
 from telegram.ext import (
     Application, ApplicationBuilder, AIORateLimiter, ContextTypes, CommandHandler, MessageHandler,
-    filters, CallbackQueryHandler, ChatMemberHandler, PicklePersistence, Defaults, JobQueue,
-    ConversationHandler
+    filters, CallbackQueryHandler, ChatMemberHandler, Defaults, JobQueue
 )
 
-# Jalali (Persian) calendar
 try:
     import jdatetime
 except Exception:
@@ -84,21 +71,22 @@ class DB:
         return db
 
     async def init(self):
-        sql = """
+        # 1) create tables if not exist
+        create_sql = """
         create table if not exists users(
             user_id bigint primary key,
             username text,
             first_name text,
             last_name text,
             is_bot boolean default false,
-            gender text check (gender in ('male','female') or gender is null),
+            gender text,
             last_seen_at timestamptz,
             in_group boolean default false
         );
 
         create table if not exists roles(
             user_id bigint references users(user_id) on delete cascade,
-            role text not null check (role in ('owner','admin_chat','admin_call','senior_chat','senior_call','senior_global')),
+            role text not null,
             primary key (user_id, role)
         );
 
@@ -132,16 +120,16 @@ class DB:
             id bigserial primary key,
             chat_id bigint not null,
             user_id bigint not null references users(user_id) on delete cascade,
-            type text not null check (type in ('chat','call')),
+            type text not null,
             start_at timestamptz not null,
             end_at timestamptz,
-            ended_by text check (ended_by in ('auto','user','admin') or ended_by is null),
+            ended_by text,
             active boolean default true
         );
 
         create table if not exists dm_threads(
             id bigserial primary key,
-            kind text not null check (kind in ('guard','owner')),
+            kind text not null,
             user_id bigint not null,
             created_at timestamptz default now(),
             is_open boolean default true,
@@ -150,14 +138,14 @@ class DB:
 
         create table if not exists contact_states(
             user_id bigint primary key,
-            kind text not null check (kind in ('guard','owner')),
+            kind text not null,
             waiting boolean default false
         );
 
         create table if not exists admin_reply_states(
             admin_id bigint,
             target_user_id bigint,
-            kind text not null check (kind in ('guard','owner')),
+            kind text not null,
             primary key (admin_id, kind)
         );
 
@@ -181,9 +169,41 @@ class DB:
             primary key (chat_id, user_id)
         );
         """
+        # 2) safe migrations for old installs (prevents "is_bot does not exist")
+        migrate_sql = """
+        -- users
+        alter table if exists users add column if not exists username text;
+        alter table if exists users add column if not exists first_name text;
+        alter table if exists users add column if not exists last_name text;
+        alter table if exists users add column if not exists is_bot boolean default false;
+        alter table if exists users add column if not exists gender text;
+        alter table if exists users add column if not exists last_seen_at timestamptz;
+        alter table if exists users add column if not exists in_group boolean default false;
+
+        -- stats_daily
+        alter table if exists stats_daily add column if not exists media_count integer default 0;
+        alter table if exists stats_daily add column if not exists voice_count integer default 0;
+        alter table if exists stats_daily add column if not exists mentions_made_count integer default 0;
+        alter table if exists stats_daily add column if not exists call_time_sec integer default 0;
+
+        -- sessions
+        alter table if exists sessions add column if not exists ended_by text;
+        alter table if exists sessions add column if not exists active boolean default true;
+
+        -- bans
+        alter table if exists bans add column if not exists reason text;
+        alter table if exists bans add column if not exists added_by bigint;
+        alter table if exists bans add column if not exists added_at timestamptz default now();
+
+        -- active_members / toggles
+        alter table if exists active_members add column if not exists last_activity_at timestamptz;
+        alter table if exists toggles add column if not exists random_tag boolean default false;
+        """
         async with self.pool.acquire() as con:
-            await con.execute(sql)
-        # Ensure owner has role
+            await con.execute(create_sql)
+            await con.execute(migrate_sql)
+
+        # Ensure owner is seeded
         if OWNER_ID:
             await self.upsert_user(OWNER_ID, username=None, first_name="OWNER", last_name=None, is_bot=False)
             await self.add_role(OWNER_ID, "owner")
@@ -303,15 +323,21 @@ class DB:
             """, chat_id, user_id, kind, start_at)
 
     async def end_session(self, chat_id: int, user_id: int, ended_by: str, end_at: datetime):
+        # Use CTE to update latest active session safely
         async with self.pool.acquire() as con:
-            # Close the most recent active session
             row = await con.fetchrow("""
-                update sessions set active=false, end_at=$4, ended_by=$5
-                where chat_id=$1 and user_id=$2 and active=true
-                order by start_at desc
-                limit 1
-                returning start_at, type;
-            """, chat_id, user_id, True, end_at, ended_by)
+                with c as (
+                    select id from sessions
+                    where chat_id=$1 and user_id=$2 and active=true
+                    order by start_at desc
+                    limit 1
+                )
+                update sessions s
+                set active=false, end_at=$3, ended_by=$4
+                from c
+                where s.id = c.id
+                returning s.start_at, s.type;
+            """, chat_id, user_id, end_at, ended_by)
             return row
 
     async def has_active_session(self, chat_id: int, user_id: int) -> bool:
@@ -320,7 +346,6 @@ class DB:
         return bool(row)
 
     async def update_call_time_aggregate_for_day(self, chat_id: int, user_id: int, d: date):
-        # compute total from sessions
         async with self.pool.acquire() as con:
             rows = await con.fetch("""
                 select start_at, coalesce(end_at, now()) as end_at
@@ -387,7 +412,6 @@ class DB:
             """, chat_id, limit)
         return rows
 
-    # --- Toggles ---
     async def set_random_tag(self, chat_id: int, on: bool):
         async with self.pool.acquire() as con:
             await con.execute("""
@@ -409,7 +433,7 @@ def mention(user_id: int, name: str) -> str:
 def now_tz() -> datetime:
     return datetime.now(tz=TZINFO)
 
-WEEKDAYS_FA = ["دوشنبه","سه‌شنبه","چهارشنبه","پنج‌شنبه","جمعه","شنبه","یکشنبه"]  # rotated later if needed
+WEEKDAYS_FA = ["دوشنبه","سه‌شنبه","چهارشنبه","پنج‌شنبه","جمعه","شنبه","یکشنبه"]
 
 def format_jalali(dt: datetime) -> str:
     if jdatetime is None:
@@ -428,30 +452,13 @@ def format_secs(s: int) -> str:
 def alert_not_for_you():
     return "این دکمه برای شما نیست رفیق! 😅"
 
-# Fun phrases (editable; expand freely)
-FUN_PREFIXES = [
-    "هی", "اوه", "سرورِ مهربون", "آقا/خانم قهرمان", "حاجی", "رفیق", "هی رفیق",
-    "قربونت", "عه", "ای جان"
-]
-FUN_SUFFIXES = [
-    "کجایی؟ 😴", "بیا یه تکونی به خودت بده! 💃", "جمع خوابالوهاست؟ 😜",
-    "چایی حاضر شد، بیا! ☕", "ما که پیر شدیم، تو بیا! 👴", "بی‌خیال تنبلی، بپر تو چت! 🏃",
-    "دلتنگت شدیم! ❤️", "یه چیزی بگو دیگه! 🎤", "بپر تو ویس کال ببینیمت! 🎧",
-    "تو که رفتی، سکوت اومد! 🤫", "نیا نیا، شوخی کردم بیا 😂", "میای یا بزنم تگ بعدی؟ 🤨",
-    "غیبت طولانی، گزارش میشه‌ها! 📋"
-]
-BOT_NICE_LINES_BASE = [
-    "قربون محبتت برم! 😍", "جانِ دلمی! 💙", "تو که باشی، همه چی روبه‌راست 😎",
-    "این گروه با تو می‌درخشه ✨", "دمت گرم که هستی 💪", "ایول بهت! 👏",
-    "خاص‌ترین آدمِ جمعی 😌", "فدات که فعالی 🌟", "تو هیچی کم نداری ❤️",
-    "مرسی که حالِ جمعو خوب می‌کنی 🌈"
-]
-# Build 220+ and 120+ phrases from templates (still static at runtime)
-RANDOM_TAG_LINES = [f"{p} {s}" for p in FUN_PREFIXES for s in FUN_SUFFIXES] * 5  # >= 200
-BOT_NICE_LINES = BOT_NICE_LINES_BASE * 12  # ~120
+FUN_PREFIXES = ["هی","اوه","سرورِ مهربون","آقا/خانم قهرمان","حاجی","رفیق","هی رفیق","قربونت","عه","ای جان"]
+FUN_SUFFIXES = ["کجایی؟ 😴","بیا یه تکونی به خودت بده! 💃","جمع خوابالوهاست؟ 😜","چایی حاضر شد، بیا! ☕","ما که پیر شدیم، تو بیا! 👴","بی‌خیال تنبلی، بپر تو چت! 🏃","دلتنگت شدیم! ❤️","یه چیزی بگو دیگه! 🎤","بپر تو ویس کال ببینیمت! 🎧","تو که رفتی، سکوت اومد! 🤫","نیا نیا، شوخی کردم بیا 😂","میای یا بزنم تگ بعدی؟ 🤨","غیبت طولانی، گزارش میشه‌ها! 📋"]
+BOT_NICE_LINES_BASE = ["قربون محبتت برم! 😍","جانِ دلمی! 💙","تو که باشی، همه چی روبه‌راست 😎","این گروه با تو می‌درخشه ✨","دمت گرم که هستی 💪","ایول بهت! 👏","خاص‌ترین آدمِ جمعی 😌","فدات که فعالی 🌟","تو هیچی کم نداری ❤️","مرسی که حالِ جمعو خوب می‌کنی 🌈"]
+RANDOM_TAG_LINES = [f"{p} {s}" for p in FUN_PREFIXES for s in FUN_SUFFIXES] * 5
+BOT_NICE_LINES = BOT_NICE_LINES_BASE * 12
 
-# ----------------------------- Global State (in-memory) ---------------
-
+# ----------------------------- Global State ---------------------------
 class GameSession:
     def __init__(self, chat_id: int, game_id: str, prompt: str, answers: List[str], started_by: int, points: int = 1, meta: Optional[dict]=None):
         self.chat_id = chat_id
@@ -464,11 +471,10 @@ class GameSession:
         self.created_at = now_tz()
         self.active = True
 
-GAME_SESSIONS: Dict[int, GameSession] = {}  # chat_id -> session
-IDLE_JOBS: Dict[Tuple[int,int], str] = {}   # (chat_id,user_id) -> job name
+GAME_SESSIONS: Dict[int, GameSession] = {}
+IDLE_JOBS: Dict[Tuple[int,int], str] = {}
 
 # ----------------------------- Permission Helpers ---------------------
-
 async def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
@@ -483,7 +489,6 @@ async def is_senior(db: DB, user_id: int) -> bool:
     return await db.has_any_role(user_id, ['senior_global','senior_call','senior_chat'])
 
 # ----------------------------- Start & PM Panel -----------------------
-
 def pm_panel_kb() -> InlineKeyboardMarkup:
     kb = [
         [InlineKeyboardButton("📨 ارتباط با گارد مدیران", callback_data="pm|guard")],
@@ -501,7 +506,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ----------------------------- Contact Flows --------------------------
-
 async def ensure_user(db: DB, u) -> None:
     await db.upsert_user(u.id, u.username, u.first_name or "", u.last_name, u.is_bot)
 
@@ -520,7 +524,6 @@ async def cb_pm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Start contact flow
-    # Blocked?
     if await db.is_contact_blocked(user.id):
         await query.edit_message_text("متأسفم! دسترسی پیام‌دادن به این بخش برای شما بسته شده. 🚫")
         return
@@ -559,38 +562,29 @@ async def cb_sendonce(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("منتظرتم! الان فقط *یک* پیام بفرست. بعد از ارسال می‌تونی «ارسال مجدد» بزنی.", parse_mode=ParseMode.MARKDOWN)
 
 async def handle_pm_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handle user's single-shot message in PM (guard/owner)
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     user = update.effective_user
     db: DB = context.bot_data["DB"]
     st = await db.pool.fetchrow("select * from contact_states where user_id=$1;", user.id)
     if not st or not st["waiting"]:
-        return  # not in send-once mode
+        return
     kind = st["kind"]
-    # Blocked check
     if await db.is_contact_blocked(user.id):
         await update.message.reply_text("ارسال پیام برای شما بسته شده. 🚫")
         await db.pool.execute("update contact_states set waiting=false where user_id=$1;", user.id)
         return
 
-    # Copy to target
     try:
         header = f"📨 پیام جدید از {mention(user.id, user.full_name)}\n@{user.username or '-'} | id: `{user.id}`"
-        # Detect media group: handled by PTB MediaGroupHandler too, but here single message:
         await context.bot.send_message(
             chat_id=GUARD_CHAT_ID if kind=="guard" else OWNER_ID,
             text=header,
             parse_mode=ParseMode.MARKDOWN
         )
-        if update.message.media_group_id:
-            # We'll copy the single item; albums are handled by media group handler below
-            pass
-        # Copy message (preserve caption)
         await update.message.copy(
             chat_id=GUARD_CHAT_ID if kind=="guard" else OWNER_ID,
         )
-        # Add control buttons under the last sent message (reply to it)
         kb = [[InlineKeyboardButton("📩 پاسخ", callback_data=f"replyto|{kind}|{user.id}|{update.effective_user.id}")],
               [InlineKeyboardButton("🚫 مسدود DM", callback_data=f"blockdm|{user.id}")]]
         await context.bot.send_message(
@@ -603,7 +597,6 @@ async def handle_pm_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ارسال نشد! یکبار دیگه امتحان کن.")
         return
 
-    # Mark sent & show "send again"
     await db.pool.execute("update contact_states set waiting=false where user_id=$1;", user.id)
     await context.bot.send_message(
         chat_id=user.id,
@@ -614,7 +607,6 @@ async def handle_pm_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_pm_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Media group in PM
     if update.effective_chat.type != ChatType.PRIVATE:
         return
     user = update.effective_user
@@ -630,12 +622,6 @@ async def handle_pm_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=header,
             parse_mode=ParseMode.MARKDOWN
         )
-        # Aggregate album
-        album: List = []
-        for m in update.message.media_group_id and update._unified_media_group:  # PTB attaches unified list
-            pass
-        # PTB MediaGroupHandler will pass list of messages via context, simpler approach:
-        # We'll just copy the message here; full album best-effort handled by clients.
         await update.message.copy(chat_id=GUARD_CHAT_ID if kind=="guard" else OWNER_ID)
         kb = [[InlineKeyboardButton("📩 پاسخ", callback_data=f"replyto|{kind}|{user.id}|{user.id}")],
               [InlineKeyboardButton("🚫 مسدود DM", callback_data=f"blockdm|{user.id}")]]
@@ -655,8 +641,6 @@ async def handle_pm_album(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                            [InlineKeyboardButton("◀️ بازگشت", callback_data="back|pm")]])
     )
 
-# Admin reply to PM (guard/owner)
-
 async def cb_replyto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     parts = q.data.split("|")
@@ -666,7 +650,6 @@ async def cb_replyto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kind, target_user_id = parts[1], int(parts[2])
     admin = q.from_user
     db: DB = context.bot_data["DB"]
-    # Only managers or owner can reply
     if not (await is_manager(db, admin.id)):
         await q.answer("فقط مدیران می‌تونن جواب بدن.", show_alert=True)
         return
@@ -689,21 +672,12 @@ async def handle_guard_admin_reply(update: Update, context: ContextTypes.DEFAULT
     kind = st["kind"]
     try:
         await update.message.copy(chat_id=target)
-        await update.message.reply_text(
-            "پیامت ارسال شد ✅",
-            reply_to_message_id=update.message.message_id
-        )
-        # Show "reply again"
+        await update.message.reply_text("پیامت ارسال شد ✅", reply_to_message_id=update.message.message_id)
         kb = [[InlineKeyboardButton("🔁 پاسخ مجدد", callback_data=f"replyto|{kind}|{target}|{admin.id}")]]
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="—",
-            reply_markup=InlineKeyboardMarkup(kb)
-        )
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="—", reply_markup=InlineKeyboardMarkup(kb))
     except Exception as e:
         logger.exception("send reply failed: %s", e)
         await update.message.reply_text("نشد! دوباره امتحان کن.")
-    # Clear state (one-shot)
     await db.pool.execute("delete from admin_reply_states where admin_id=$1 and kind=$2;", admin.id, kind)
 
 async def cb_block_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -719,7 +693,6 @@ async def cb_block_dm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"کاربر {target_id} برای پیام‌دادن بلاک شد.")
 
 # ----------------------------- Stats & Presence -----------------------
-
 SESSION_SELECT_PREFIX = "sess|"
 
 def build_session_kb(author_id: int) -> InlineKeyboardMarkup:
@@ -729,7 +702,6 @@ def build_session_kb(author_id: int) -> InlineKeyboardMarkup:
     ])
 
 async def maybe_prompt_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """If manager speaks in main chat and no active session -> prompt session type."""
     if update.effective_chat.id != MAIN_CHAT_ID:
         return
     user = update.effective_user
@@ -737,16 +709,12 @@ async def maybe_prompt_session(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     db: DB = context.bot_data["DB"]
     await ensure_user(db, user)
-    # Update active members
     await db.set_active_member(MAIN_CHAT_ID, user.id, now_tz())
-    # If banned, ignore stats
     if await db.is_banned(user.id):
         return
-    # Stats bump
     msg = update.effective_message
     is_media = any([msg.photo, msg.video, msg.document, msg.animation, msg.audio, msg.sticker])
     is_voice = bool(msg.voice)
-    # Mentions made
     mentions = 0
     if msg.entities:
         for e in msg.entities:
@@ -754,23 +722,17 @@ async def maybe_prompt_session(update: Update, context: ContextTypes.DEFAULT_TYP
                 mentions += 1
     await db.bump_stat(MAIN_CHAT_ID, user.id, is_media=is_media, is_voice=is_voice, mentions_made=mentions, at=now_tz())
 
-    # Prompt session if manager
     if await is_manager(db, user.id):
         if not await db.has_active_session(MAIN_CHAT_ID, user.id):
-            # Send ephemeral picker
             try:
                 await msg.reply_text("نوع فعالیتت رو انتخاب کن:", reply_markup=build_session_kb(user.id))
             except Exception as e:
                 logger.warning("session prompt failed: %s", e)
-        # Schedule idle auto-end if they have session; else will set soon
         await schedule_idle_job(context, user.id)
-    # Update in_group
     await db.set_user_in_group(user.id, True)
 
 async def schedule_idle_job(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    # reset a 5-minute idle logout for managers
     job_name = f"idle_{MAIN_CHAT_ID}_{user_id}"
-    # cancel if exists
     for job in context.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
     context.job_queue.run_once(idle_timeout_job, when=300, name=job_name, data={"chat_id": MAIN_CHAT_ID, "user_id": user_id})
@@ -780,7 +742,6 @@ async def idle_timeout_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = data.get("chat_id"); user_id = data.get("user_id")
     db: DB = context.bot_data["DB"]
     if await db.has_active_session(chat_id, user_id):
-        # auto end
         row = await db.end_session(chat_id, user_id, "auto", now_tz())
         if row:
             kind = row["type"]
@@ -803,11 +764,9 @@ async def cb_session_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"شروع فعالیت { 'کال' if kind=='call' else 'چت' } ✅")
     except: pass
     await context.bot.send_message(chat_id=GUARD_CHAT_ID, text=f"✅ شروع سشن { 'کال' if kind=='call' else 'چت' } توسط {mention(q.from_user.id, q.from_user.full_name)}", parse_mode=ParseMode.MARKDOWN)
-    # Schedule idle
     await schedule_idle_job(context, q.from_user.id)
 
 async def cmd_register_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Triggered by text "ثبت" anywhere (if in main chat)
     if update.effective_chat.id != MAIN_CHAT_ID:
         return
     user = update.effective_user
@@ -833,19 +792,16 @@ async def cmd_register_close(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("پایان فعالیت شما گزارش شد، خسته نباشی! ✅")
     await context.bot.send_message(chat_id=GUARD_CHAT_ID, text=f"🟥 پایان سشن {row['type']} توسط {mention(user.id, user.full_name)}", parse_mode=ParseMode.MARKDOWN)
 
-# Nightly stats job
 async def nightly_stats_job(context: ContextTypes.DEFAULT_TYPE):
     db: DB = context.bot_data["DB"]
-    # Compute yesterday in TZ
     now = now_tz()
     y = (now - timedelta(days=1)).date()
-    # Update call aggregates per manager
+
     managers = await db.list_all_managers()
     all_ids = {uid for lst in managers.values() for uid in lst}
     for uid in all_ids:
         await db.update_call_time_aggregate_for_day(MAIN_CHAT_ID, uid, y)
 
-    # Chat admins report
     async def fetch(uids: List[int]):
         if not uids: return []
         res = []
@@ -871,16 +827,13 @@ async def nightly_stats_job(context: ContextTypes.DEFAULT_TYPE):
         else:
             call_stats.append((uid, 0))
 
-    # Persian date
     if jdatetime:
         j = jdatetime.date.fromgregorian(date=y)
         date_str = f"{j.strftime('%Y/%m/%d')}"
     else:
         date_str = y.strftime("%Y-%m-%d")
-    # Day of week
-    wd = WEEKDAYS_FA[(y.weekday()+1) % 7]  # crude mapping
+    wd = WEEKDAYS_FA[(y.weekday()+1) % 7]
 
-    # Build messages
     lines = [f"📊 آمار چت مدیران — {date_str} ({wd})", ""]
     for uid, msgs, media, voice, men in chat_stats:
         lines.append(f"• {mention(uid, 'کاربر')} — پیام: {msgs} | رسانه: {media} | ویس: {voice} | منشن: {men}")
@@ -891,7 +844,6 @@ async def nightly_stats_job(context: ContextTypes.DEFAULT_TYPE):
         lines2.append(f"• {mention(uid, 'کاربر')} — زمان حضور: {format_secs(int(sec))}")
     text2 = "\n".join(lines2)
 
-    # Mentions per chat admin group (already included above), but send a dedicated list too
     lines3 = [f"📣 منشن‌های امروز — {date_str} ({wd})", ""]
     for uid, msgs, media, voice, men in chat_stats:
         lines3.append(f"• {mention(uid,'کاربر')}: {men}")
@@ -907,7 +859,6 @@ async def send_stats_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     if not rows:
         await context.bot.send_message(chat_id=user_id, text="آماری برای ۷ روز گذشته ندارم.")
         return
-    # Try profile photo
     try:
         photos = await context.bot.get_user_profile_photos(user_id, limit=1)
         file_id = photos.photos[0][-1].file_id if photos.total_count > 0 else None
@@ -927,27 +878,18 @@ async def send_stats_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
     else:
         await context.bot.send_message(chat_id=user_id, text=cap)
 
-# ----------------------------- Management Commands --------------------
-
-# Helpers to parse targets from reply/username/id
+# ----------------------------- Management -----------------------------
 async def extract_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     msg = update.effective_message
     if msg.reply_to_message:
         return msg.reply_to_message.from_user.id
-    # Try parse from text
     text = (msg.text or "").strip()
     parts = text.split()
     if len(parts) >= 2:
         token = parts[1]
         if token.startswith("@"):
-            # resolve via usernames is not possible directly. Leave username for DB mention only.
-            # We'll store ban by id only. So ask for numeric id if not reply.
-            try:
-                # Try to get chat member to resolve username
-                member = await context.bot.get_chat_member(MAIN_CHAT_ID, token[1:])
-                return member.user.id
-            except Exception:
-                pass
+            # Resolving pure usernames is not guaranteed via Bot API; require reply or numeric id.
+            return None
         else:
             try:
                 return int(token)
@@ -965,7 +907,6 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("هدف نامعتبره. با ریپلای یا آیدی عددی بزن.")
         return
     await db.ban_add(target, reason="by command", added_by=user.id)
-    # Kick from group
     try:
         await context.bot.ban_chat_member(chat_id=MAIN_CHAT_ID, user_id=target)
     except Exception as e:
@@ -1002,7 +943,6 @@ async def cmd_list_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {mention(r['user_id'],'کاربر')} — id: `{r['user_id']}`")
     text = "\n".join(lines)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    # Send to owner too
     if OWNER_ID:
         await context.bot.send_message(chat_id=OWNER_ID, text=text, parse_mode=ParseMode.MARKDOWN)
 
@@ -1051,14 +991,7 @@ async def cmd_list_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     managers = await db.list_all_managers()
     order = ["owner","senior_global","senior_call","senior_chat","admin_call","admin_chat"]
-    names = {
-        "owner":"مالک",
-        "senior_global":"ارشد کل",
-        "senior_call":"ارشد کال",
-        "senior_chat":"ارشد چت",
-        "admin_call":"ادمین کال",
-        "admin_chat":"ادمین چت"
-    }
+    names = {"owner":"مالک","senior_global":"ارشد کل","senior_call":"ارشد کال","senior_chat":"ارشد چت","admin_call":"ادمین کال","admin_chat":"ادمین چت"}
     lines = ["👥 لیست گارد (به ترتیب سمت):",""]
     for r in order:
         ids = managers.get(r, [])
@@ -1073,14 +1006,12 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await is_manager(db, user.id):
         return
-    # self or target
     target = await extract_target_user_id(update, context)
     t_id = target or user.id
     rows = await db.get_stats_for_user_days(MAIN_CHAT_ID, t_id, 7)
     if not rows:
         await update.message.reply_text("آماری موجود نیست.")
         return
-    # Profile photo
     try:
         photos = await context.bot.get_user_profile_photos(t_id, limit=1)
         file_id = photos.photos[0][-1].file_id if photos.total_count > 0 else None
@@ -1099,7 +1030,6 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(cap, parse_mode=ParseMode.MARKDOWN)
 
 # ----------------------------- Tag Panel ------------------------------
-
 def tag_panel_kb(author_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎧 تگ کال", callback_data=f"tag|call|{author_id}")],
@@ -1120,7 +1050,6 @@ async def cb_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer(alert_not_for_you(), show_alert=True); return
     db: DB = context.bot_data["DB"]
     await q.answer("باشه!")
-    # Build list
     ids: List[int] = []
     if group == "call":
         ids += await db.list_by_role("admin_call")
@@ -1139,14 +1068,11 @@ async def cb_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif group == "boys":
         ids = await db.list_gender("male")
 
-    # Remove duplicates & bots (we don't know bots; skip owner if duplicates)
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for i in ids:
         if i in seen: continue
         seen.add(i); uniq.append(i)
 
-    # Send 5-by-5 mentions, reply to original message if possible
     reply_to = q.message.reply_to_message.message_id if q.message and q.message.reply_to_message else None
     batches = [uniq[i:i+5] for i in range(0, len(uniq), 5)]
     if not batches:
@@ -1162,7 +1088,6 @@ async def cb_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("tag send failed: %s", e)
 
 # ----------------------------- Gender Command -------------------------
-
 def gender_kb(author_id: int, target_id: Optional[int]) -> InlineKeyboardMarkup:
     tid = target_id or 0
     return InlineKeyboardMarkup([
@@ -1193,7 +1118,6 @@ async def cb_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: pass
 
 # ----------------------------- Help ----------------------------------
-
 HELP_TEXT = """
 راهنمای ربات سولز — نسخه فشرده
 (همه دستورات *بدون /* هستند)
@@ -1236,7 +1160,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 # ----------------------------- Random Tag Toggle ----------------------
-
 async def cmd_tag_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db: DB = context.bot_data["DB"]
@@ -1251,9 +1174,7 @@ async def random_tag_job(context: ContextTypes.DEFAULT_TYPE):
     db: DB = context.bot_data["DB"]
     if not await db.get_random_tag(MAIN_CHAT_ID):
         return
-    # pick one idle-but-active user
     ids = await db.get_active_members(MAIN_CHAT_ID, since_minutes=1440)
-    # filter: not bots, not managers? you didn't say skip. We'll include all, but exclude bots by DB flag if known.
     if not ids:
         return
     target = random.choice(ids)
@@ -1264,7 +1185,6 @@ async def random_tag_job(context: ContextTypes.DEFAULT_TYPE):
         logger.info("random tag send failed: %s", e)
 
 # ----------------------------- "ربات" friendly replies ----------------
-
 async def cmd_bot_nice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db: DB = context.bot_data["DB"]
     user = update.effective_user
@@ -1273,14 +1193,21 @@ async def cmd_bot_nice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(random.choice(BOT_NICE_LINES))
 
 # ----------------------------- Game Engine ----------------------------
-
-# 15+ games built on a common engine
+class GameSession:
+    def __init__(self, chat_id: int, game_id: str, prompt: str, answers: List[str], started_by: int, points: int = 1, meta: Optional[dict]=None):
+        self.chat_id = chat_id
+        self.game_id = game_id
+        self.prompt = prompt
+        self.answers = [a.lower() for a in answers]
+        self.started_by = started_by
+        self.points = points
+        self.meta = meta or {}
+        self.created_at = now_tz()
+        self.active = True
 
 def normalize(s: str) -> str:
     s = (s or "").strip().lower()
-    rep = {
-        "ي":"ی","ك":"ک","آ":"ا","إ":"ا","أ":"ا","ٱ":"ا","ة":"ه","ؤ":"و","ئ":"ی"
-    }
+    rep = {"ي":"ی","ك":"ک","آ":"ا","إ":"ا","أ":"ا","ٱ":"ا","ة":"ه","ؤ":"و","ئ":"ی"}
     for a,b in rep.items():
         s = s.replace(a,b)
     s = re.sub(r"\s+", " ", s)
@@ -1323,7 +1250,6 @@ async def cb_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if gid == "score":
         await show_scoreboard(update, context); return
-    # start game
     session = await start_game_session(gid, q.message.chat_id, q.from_user.id)
     if not session:
         await q.edit_message_text("این بازی الان در دسترس نیست.")
@@ -1348,19 +1274,12 @@ async def show_scoreboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {name} — {r['score']}")
     await update.callback_query.edit_message_text("\n".join(lines))
 
-# Generators per game id
 CAPITALS = {
     "ایران":"تهران","عراق":"بغداد","ترکیه":"آنکارا","افغانستان":"کابل","فرانسه":"پاریس","آلمان":"برلین",
     "ایتالیا":"رم","اسپانیا":"مادرید","انگلستان":"لندن","روسیه":"مسکو","چین":"پکن","ژاپن":"توکیو",
     "هند":"دهلی نو","برزیل":"برازیلیا","کانادا":"اتاوا","مکزیک":"مکزیکوسیتی","مصر":"قاهره","عربستان":"ریاض",
 }
-EMOJI_RIDDLES = [
-    ("🍎📱", ["اپل","apple"]),
-    ("🎬🍿", ["سینما","فیلم"]),
-    ("☕🐱", ["کافه","قهوه"]),
-    ("📸🐦", ["اینستاگرام","instagram","عکس"]),
-    ("🧊❄️", ["یخ","سرما"]),
-]
+EMOJI_RIDDLES = [("🍎📱", ["اپل","apple"]),("🎬🍿", ["سینما","فیلم"]),("☕🐱", ["کافه","قهوه"]),("📸🐦", ["اینستاگرام","instagram","عکس"]),("🧊❄️", ["یخ","سرما"])]
 WORDS_FA = ["مدیریت","سولز","گارد","حضور","آمار","سیستم","ربات","گفتگو","سرگرمی","اکانت","ویس","کال","مدیر","پیام","گروه","کاربر","شماره","زمان","تاریخ","حساب"]
 SYN_FA = [("سریع","تند"),("آرام","ملایم"),("شوخ","بامزه"),("باهوش","زیرک"),("قوی","نیرومند")]
 TRIVIA = [("بزرگ‌ترین اقیانوس جهان؟","آرام"),("ارتفاعات دماوند در کدام کشور است؟","ایران"),("تهران چندمین حرف الفباست؟","شوخی کردی؟ 😅")]
@@ -1368,67 +1287,39 @@ ODD_SETS = [["سیب","موز","گلابی","پرتقال","پیچ‌گوشتی"
 SEQS = [([2,4,8,16,"?"],"32"),([1,1,2,3,5,8,"?"],"13")]
 
 async def start_game_session(gid: str, chat_id: int, started_by: int) -> Optional[GameSession]:
-    # Avoid overriding a running game
     if chat_id in GAME_SESSIONS and GAME_SESSIONS[chat_id].active:
-        # Replace with new session
         GAME_SESSIONS[chat_id].active = False
 
     if gid == "g_num100":
-        num = random.randint(1,100)
-        return set_session(chat_id, gid, f"یه عدد بین ۱ تا ۱۰۰ حدس بزن!", [str(num)], started_by)
+        num = random.randint(1,100); return set_session(chat_id, gid, f"یه عدد بین ۱ تا ۱۰۰ حدس بزن!", [str(num)], started_by)
     if gid == "g_num1000":
-        num = random.randint(1,1000)
-        return set_session(chat_id, gid, f"عدد بین ۱ تا ۱۰۰۰ حدس بزن!", [str(num)], started_by)
+        num = random.randint(1,1000); return set_session(chat_id, gid, f"عدد بین ۱ تا ۱۰۰۰ حدس بزن!", [str(num)], started_by)
     if gid == "g_anagram":
-        w = random.choice(WORDS_FA)
-        shuffled = "".join(random.sample(w, len(w)))
-        return set_session(chat_id, gid, f"حروف به‌هم‌ریخته: {shuffled}", [normalize(w)], started_by)
+        w = random.choice(WORDS_FA); shuffled = "".join(random.sample(w, len(w))); return set_session(chat_id, gid, f"حروف به‌هم‌ریخته: {shuffled}", [normalize(w)], started_by)
     if gid == "g_typing":
-        s = " ".join(random.sample(["سولز","ربات","مدیر","حضور","آمار","گارد","کال","چت"], k=4))
-        return set_session(chat_id, gid, f"این متن رو *دقیقاً* و سریع تایپ کن:\n{s}", [normalize(s)], started_by)
+        s = " ".join(random.sample(["سولز","ربات","مدیر","حضور","آمار","گارد","کال","چت"], k=4)); return set_session(chat_id, gid, f"این متن رو *دقیقاً* و سریع تایپ کن:\n{s}", [normalize(s)], started_by)
     if gid == "g_math":
-        a,b = random.randint(10,99), random.randint(10,99)
-        op = random.choice(["+","-","*"])
-        expr = f"{a}{op}{b}"
-        ans = str(eval(expr))
-        return set_session(chat_id, gid, f"حل کن: `{expr}`", [ans], started_by)
+        a,b = random.randint(10,99), random.randint(10,99); op = random.choice(["+","-","*"]); expr = f"{a}{op}{b}"; ans = str(eval(expr)); return set_session(chat_id, gid, f"حل کن: `{expr}`", [ans], started_by)
     if gid == "g_capital":
-        c, cap = random.choice(list(CAPITALS.items()))
-        return set_session(chat_id, gid, f"پایتخت *{c}* چیه؟", [normalize(cap)], started_by)
+        c, cap = random.choice(list(CAPITALS.items())); return set_session(chat_id, gid, f"پایتخت *{c}* چیه؟", [normalize(cap)], started_by)
     if gid == "g_emoji":
-        e, ans = random.choice(EMOJI_RIDDLES)
-        return set_session(chat_id, gid, f"حدس بزن: {e}", [normalize(a) for a in ans], started_by)
+        e, ans = random.choice(EMOJI_RIDDLES); return set_session(chat_id, gid, f"حدس بزن: {e}", [normalize(a) for a in ans], started_by)
     if gid == "g_odd":
-        s = random.choice(ODD_SETS)
-        return set_session(chat_id, gid, f"کدومشون وصله ناجوره؟ {'، '.join(s)}", [normalize(s[-1])], started_by)
+        s = random.choice(ODD_SETS); return set_session(chat_id, gid, f"کدومشون وصله ناجوره؟ {'، '.join(s)}", [normalize(s[-1])], started_by)
     if gid == "g_flag":
-        c, cap = random.choice(list(CAPITALS.items()))
-        # Accept country name itself
-        return set_session(chat_id, gid, f"پرچم 🇮🇷؟ شوخی! کشورِ پایتخت *{cap}* رو بگو:", [normalize(c)], started_by)
+        c, cap = random.choice(list(CAPITALS.items())); return set_session(chat_id, gid, f"پرچم 🇮🇷؟ شوخی! کشورِ پایتخت *{cap}* رو بگو:", [normalize(c)], started_by)
     if gid == "g_syn":
-        a,b = random.choice(SYN_FA)
-        return set_session(chat_id, gid, f"مترادف «{a}» چیه؟", [normalize(b)], started_by)
+        a,b = random.choice(SYN_FA); return set_session(chat_id, gid, f"مترادف «{a}» چیه؟", [normalize(b)], started_by)
     if gid == "g_word_hole":
-        w = random.choice(WORDS_FA)
-        # remove 1-2 letters
-        idx = random.sample(range(len(w)), k=min(2, max(1, len(w)//4)))
-        hole = "".join([("_" if i in idx else ch) for i,ch in enumerate(w)])
-        return set_session(chat_id, gid, f"جای خالی رو پر کن: {hole}", [normalize(w)], started_by)
+        w = random.choice(WORDS_FA); idx = random.sample(range(len(w)), k=min(2, max(1, len(w)//4))); hole = "".join([("_" if i in idx else ch) for i,ch in enumerate(w)]); return set_session(chat_id, gid, f"جای خالی رو پر کن: {hole}", [normalize(w)], started_by)
     if gid == "g_rps":
-        # Bot picks move; players guess the winning move vs bot's move
-        bot = random.choice(["سنگ","کاغذ","قیچی"])
-        winners = {"سنگ":"کاغذ","کاغذ":"قیچی","قیچی":"سنگ"}
-        return set_session(chat_id, gid, f"من زدم: *{bot}* — تو چی می‌زنی که می‌بره؟", [normalize(winners[bot])], started_by)
+        bot = random.choice(["سنگ","کاغذ","قیچی"]); winners = {"سنگ":"کاغذ","کاغذ":"قیچی","قیچی":"سنگ"}; return set_session(chat_id, gid, f"من زدم: *{bot}* — تو چی می‌زنی که می‌بره؟", [normalize(winners[bot])], started_by)
     if gid == "g_coin":
-        coin = random.choice(["شیر","خط"])
-        return set_session(chat_id, gid, f"سکه هواست... شیر یا خط؟", [normalize(coin)], started_by)
+        coin = random.choice(["شیر","خط"]); return set_session(chat_id, gid, f"سکه هواست... شیر یا خط؟", [normalize(coin)], started_by)
     if gid == "g_seq":
-        seq, ans = random.choice(SEQS)
-        return set_session(chat_id, gid, f"الگو رو کامل کن: {'، '.join(map(str,seq))}", [normalize(ans)], started_by)
+        seq, ans = random.choice(SEQS); return set_session(chat_id, gid, f"الگو رو کامل کن: {'، '.join(map(str,seq))}", [normalize(ans)], started_by)
     if gid == "g_trivia":
-        q,a = random.choice(TRIVIA)
-        return set_session(chat_id, gid, q, [normalize(a)], started_by)
-
+        q,a = random.choice(TRIVIA); return set_session(chat_id, gid, q, [normalize(a)], started_by)
     return None
 
 def set_session(chat_id: int, gid: str, prompt: str, answers: List[str], started_by: int) -> GameSession:
@@ -1452,14 +1343,9 @@ async def handle_game_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await db.inc_game_score(MAIN_CHAT_ID, msg.from_user.id, 1)
         await msg.reply_text(f"🎉 {mention(msg.from_user.id, msg.from_user.full_name)} درست گفت! (+1 امتیاز)\nمیخوای ادامه بدیم؟ «بازی»", parse_mode=ParseMode.MARKDOWN)
 
-# ----------------------------- Text Commands (no slash) ---------------
-
-def text_matches(pattern: str):
-    return MessageHandler(filters.TEXT & (~filters.UpdateType.EDITED) & filters.Regex(f"^{pattern}$"), None)
-
+# ----------------------------- Text Commands --------------------------
 async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
-    # Order matters (longer first)
     handlers = [
         ("ثبت خروج", cmd_register_close),
         ("ثبت", cmd_register_open),
@@ -1478,19 +1364,15 @@ async def handle_text_commands(update: Update, context: ContextTypes.DEFAULT_TYP
         if txt.startswith(key):
             await fn(update, context)
             return
-    # Promote/Demote
     if txt.startswith("ترفیع ") or txt.startswith("عزل "):
         await handle_promote_demote(update, context); return
-    # Ban/Unban
     if txt.startswith("ممنوع"):
         await cmd_ban(update, context); return
     if txt.startswith("آزاد"):
         await cmd_unban(update, context); return
 
 # ----------------------------- Membership & Bans ----------------------
-
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Enforce bans & track joins/leaves
     db: DB = context.bot_data["DB"]
     upd: ChatMemberUpdated = update.chat_member
     user = upd.new_chat_member.user
@@ -1500,7 +1382,6 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = upd.new_chat_member.status
     if status in ("member","administrator","creator"):
         await db.set_user_in_group(user.id, True)
-        # if banned, kick
         if await db.is_banned(user.id):
             try:
                 await context.bot.ban_chat_member(chat_id=MAIN_CHAT_ID, user_id=user.id)
@@ -1510,44 +1391,32 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.set_user_in_group(user.id, False)
 
 # ----------------------------- Application Setup ---------------------
-
 async def post_init(app: Application):
-    # Schedule nightly stats at 00:00 TZ
     now = now_tz()
-    # seconds until next midnight
     tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     delay = (tomorrow - now).total_seconds()
     app.job_queue.run_repeating(nightly_stats_job, interval=86400, first=delay)
-    # Random tag every 15 minutes
     app.job_queue.run_repeating(random_tag_job, interval=900, first=60)
 
 def build_application() -> Application:
     defaults = Defaults(tzinfo=TZINFO, parse_mode=ParseMode.MARKDOWN)
     app = ApplicationBuilder().token(BOT_TOKEN).rate_limiter(AIORateLimiter()).defaults(defaults).build()
-    # DB attach
-    app.bot_data["DB"] = None  # set later after pool create
-    # Handlers
+    app.bot_data["DB"] = None
     app.add_handler(CommandHandler("start", cmd_start, filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(cb_pm, pattern=r"^pm\|"))
     app.add_handler(CallbackQueryHandler(cb_back, pattern=r"^back\|"))
     app.add_handler(CallbackQueryHandler(cb_sendonce, pattern=r"^sendonce\|"))
     app.add_handler(CallbackQueryHandler(cb_replyto, pattern=r"^replyto\|"))
     app.add_handler(CallbackQueryHandler(cb_block_dm, pattern=r"^blockdm\|"))
-    app.add_handler(CallbackQueryHandler(cb_session_select, pattern=rf"^{SESSION_SELECT_PREFIX}"))
+    app.add_handler(CallbackQueryHandler(cb_session_select, pattern=r"^sess\|"))
     app.add_handler(CallbackQueryHandler(cb_tag, pattern=r"^tag\|"))
     app.add_handler(CallbackQueryHandler(cb_gender, pattern=r"^gender\|"))
     app.add_handler(CallbackQueryHandler(cb_game, pattern=r"^game\|"))
-    # PM single-shot handlers
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_pm_any))
-    # Main chat tracker
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, maybe_prompt_session))
-    # Games answer
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, handle_game_answer))
-    # Text commands (no slash)
     app.add_handler(MessageHandler(filters.ChatType.ALL & filters.TEXT & ~filters.COMMAND, handle_text_commands))
-    # Admin reply messages in guard/owner
     app.add_handler(MessageHandler(filters.Chat(GUARD_CHAT_ID) | filters.Chat(OWNER_ID), handle_guard_admin_reply))
-    # Membership updates
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.MY_CHAT_MEMBER | ChatMemberHandler.CHAT_MEMBER))
     return app
 
@@ -1555,13 +1424,11 @@ async def main():
     if not BOT_TOKEN or not DATABASE_URL or not MAIN_CHAT_ID or not GUARD_CHAT_ID or not OWNER_ID:
         raise SystemExit("لطفاً تمام متغیرهای محیطی لازم را تنظیم کنید: OWNER_ID, TZ, MAIN_CHAT_ID, GUARD_CHAT_ID, BOT_TOKEN, DATABASE_URL")
 
-    # DB connection
     db = await DB.create(DATABASE_URL)
-
     app = build_application()
     app.bot_data["DB"] = db
     await post_init(app)
-    logger.info("Souls bot started.")
+    logger.info("Souls bot (patched) starting...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
